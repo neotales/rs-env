@@ -1,17 +1,29 @@
 [package]
 name = "neotales-env"
 description = "Pure environment interpolation, PATH composition and reversible shell diffs, with no process mutation"
-version = "0.0.0-alpha.1"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.0.0-alpha.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/neotales/rs-env"
+authors = ["Neotales"]
 readme = "README.md"
 keywords = ["environment", "dotenv", "path", "shell", "interpolation"]
 categories = ["command-line-interface", "config"]
 
 [dependencies]
-indexmap.workspace = true
+indexmap = { version = "2.12", features = ["serde"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

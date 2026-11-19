@@ -803,7 +803,7 @@ mod tests {
             }
         );
         // Nothing half-recorded, so the diff is still renderable.
-        assert!(diff.changes().is_empty());
+        assert_eq!(diff.changes(), []);
         assert_eq!(diff.render(Shell::Bash), "");
     }
     #[test]

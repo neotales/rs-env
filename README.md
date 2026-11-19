@@ -17,4 +17,4 @@ assert_eq!(braced, "/home/dev/bin");
 
 ## License
 
-MIT. See the workspace `LICENSE.md`.
+MIT. See [LICENSE.md](LICENSE.md).
