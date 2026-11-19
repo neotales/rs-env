@@ -5,6 +5,10 @@ use std::fmt;
 
 use indexmap::IndexMap;
 
+mod expand;
+
+pub use expand::{ExpandOptions, expand, expand_with, expand_with_options};
+
 /// Platform rules used for environment-key and PATH handling.
 ///
 /// The same environment variable is spelled with different capitalisation on the
@@ -40,6 +44,29 @@ impl Platform {
             Self::Unix => ':',
             Self::Windows => ';',
         }
+    }
+
+    /// Returns the conventional spelling of the `PATH` variable on this
+    /// platform.
+    ///
+    /// The Unix spelling is `PATH`; the Windows spelling is `Path`. A caller
+    /// working through an [`Environment`] can use the spelling it prefers,
+    /// because that type compares keys by the platform's rules.
+    #[must_use]
+    pub const fn path_key(self) -> &'static str {
+        match self {
+            Self::Unix => "PATH",
+            Self::Windows => "Path",
+        }
+    }
+
+    /// Joins `entries` with this platform's `PATH` separator.
+    #[must_use]
+    pub fn join_path<'a>(self, entries: impl IntoIterator<Item = &'a str>) -> String {
+        entries
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(&self.path_separator().to_string())
     }
 
     /// Compares two environment keys under this platform's rules.
@@ -123,112 +150,119 @@ impl Environment {
     pub fn as_map(&self) -> &IndexMap<String, String> {
         &self.values
     }
-}
 
-/// Expands `$NAME` and `${NAME}` using explicitly supplied values. Unset names are empty.
-#[must_use]
-pub fn expand(value: &str, environment: &Environment) -> String {
-    expand_with(value, |name| environment.get(name))
-}
-
-/// Expands `$NAME` and `${NAME}` using an explicit lookup function.
-///
-/// A name is a run of ASCII letters, digits and underscores, and the character
-/// that ends it is not part of it. The unbraced form therefore keeps the `/` in
-/// `$HOME/bin` rather than swallowing it into the name:
-///
-/// ```
-/// use neotales_env::expand_with;
-///
-/// let home = expand_with("$HOME/bin", |name| (name == "HOME").then_some("/home/dev"));
-/// assert_eq!(home, "/home/dev/bin");
-/// ```
-#[must_use]
-pub fn expand_with<'a>(value: &str, mut lookup: impl FnMut(&str) -> Option<&'a str>) -> String {
-    let mut output = String::with_capacity(value.len());
-    // `rest` is the part of `value` not yet copied, and it is always sliced
-    // rather than iterated, so the character that ends a name is still at the
-    // front of `rest` when the next iteration looks at it.
-    let mut rest = value;
-    while let Some(dollar) = rest.find('$') {
-        output.push_str(&rest[..dollar]);
-        rest = &rest[dollar + 1..];
-        if let Some(braced) = rest.strip_prefix('{') {
-            // A `${NAME` with no closing brace takes the rest of the value as
-            // its name, which is what the braced form has always done.
-            let end = braced.find('}').unwrap_or(braced.len());
-            output.push_str(lookup(&braced[..end]).unwrap_or(""));
-            // The closing brace is consumed here rather than by a `take_while`
-            // that had to eat it to stop. `braced[end]` is the brace, so
-            // `end + 1` is the next character boundary.
-            rest = if end < braced.len() {
-                &braced[end + 1..]
-            } else {
-                ""
-            };
-            continue;
-        }
-        let end = name_end(rest);
-        if end == 0 {
-            // A `$` with no name after it is literal, and whatever follows it
-            // has not been looked at yet.
-            output.push('$');
-        } else {
-            output.push_str(lookup(&rest[..end]).unwrap_or(""));
-            rest = &rest[end..];
-        }
+    /// Reports whether `key` is set, including when its value is empty.
+    ///
+    /// This is the distinction [`get`](Self::get) cannot express: `Some("")` is
+    /// set, and `None` is not.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        self.get(key).is_some()
     }
-    output.push_str(rest);
-    output
-}
 
-/// Returns the byte length of the variable name at the start of `value`.
-///
-/// Zero means there is no name there, so the caller emits a literal `$` rather
-/// than a lookup. The name characters are the set the unbraced form has always
-/// accepted; only the handling of the character after them has changed.
-fn name_end(value: &str) -> usize {
-    value
-        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-        .unwrap_or(value.len())
+    /// Returns the `PATH` value for this platform, or `""` when it is not set.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.get(self.platform.path_key()).unwrap_or("")
+    }
+
+    /// Sets the `PATH` value for this platform, returning whatever it held
+    /// before.
+    pub fn set_path(&mut self, value: impl Into<String>) -> Option<String> {
+        self.insert(self.platform.path_key(), value)
+    }
+
+    /// Splits the `PATH` value on this platform's separator.
+    ///
+    /// An unset or empty value yields one empty entry, which is what splitting
+    /// an empty string produces. The path helpers skip empty entries when they
+    /// compose a value, so a leading or trailing separator is not introduced.
+    #[must_use]
+    pub fn split_path(&self) -> Vec<&str> {
+        self.path().split(self.platform.path_separator()).collect()
+    }
+
+    /// Reports whether `entry` is in `PATH`, using the platform's case rules.
+    ///
+    /// Windows compares entries without regard to case; Unix does not.
+    #[must_use]
+    pub fn has_path(&self, entry: &str) -> bool {
+        self.split_path()
+            .iter()
+            .any(|existing| self.platform.keys_equal(existing, entry))
+    }
+
+    /// Puts `entry` at the front of `PATH`, and reports whether it changed.
+    ///
+    /// An entry already at the front is left alone, matching the Go package's
+    /// `PrependPath`. An existing empty `PATH` is treated as unset.
+    pub fn prepend_path(&mut self, entry: &str) -> bool {
+        if self
+            .split_path()
+            .first()
+            .is_some_and(|first| self.platform.keys_equal(first, entry))
+        {
+            return false;
+        }
+        let value = path_prepend(
+            self.get(self.platform.path_key()),
+            std::slice::from_ref(&entry.to_owned()),
+            self.platform,
+        );
+        self.set_path(value);
+        true
+    }
+
+    /// Puts `entry` at the end of `PATH`, and reports whether it changed.
+    ///
+    /// An entry already at the end is left alone, matching the Go package's
+    /// `AppendPath`. An existing empty `PATH` is treated as unset.
+    pub fn append_path(&mut self, entry: &str) -> bool {
+        if self
+            .split_path()
+            .last()
+            .is_some_and(|last| self.platform.keys_equal(last, entry))
+        {
+            return false;
+        }
+        let value = path_append(
+            self.get(self.platform.path_key()),
+            std::slice::from_ref(&entry.to_owned()),
+            self.platform,
+        );
+        self.set_path(value);
+        true
+    }
 }
 
 /// Prepends entries in declaration order, preserving an empty existing value as absent.
 #[must_use]
 pub fn path_prepend(existing: Option<&str>, entries: &[String], platform: Platform) -> String {
-    join_path(
+    platform.join_path(
         entries
             .iter()
             .map(String::as_str)
             .chain(existing.filter(|value| !value.is_empty())),
-        platform,
     )
 }
 
 /// Appends entries in declaration order, preserving an empty existing value as absent.
 #[must_use]
 pub fn path_append(existing: Option<&str>, entries: &[String], platform: Platform) -> String {
-    join_path(
+    platform.join_path(
         existing
             .filter(|value| !value.is_empty())
             .into_iter()
             .chain(entries.iter().map(String::as_str)),
-        platform,
     )
-}
-
-fn join_path<'a>(entries: impl Iterator<Item = &'a str>, platform: Platform) -> String {
-    entries
-        .collect::<Vec<_>>()
-        .join(&platform.path_separator().to_string())
 }
 
 /// Something the environment helpers could not accept.
 ///
 /// This is the crate's only error, and it is returned where the bad value
-/// arrives rather than where it would later be noticed. There is nothing to
-/// recover from at the point of reporting, so it carries the offending value
-/// and nothing else.
+/// arrives rather than where it would later be noticed. Variants carry only
+/// what the caller needs to report or match on; an expansion error never echoes
+/// the whole input, because an input can hold a secret.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EnvError {
     /// A key is not a name that a shell or an operating system will accept.
@@ -240,6 +274,38 @@ pub enum EnvError {
         /// The rejected key, exactly as it was given.
         key: String,
     },
+    /// An expansion reference is malformed.
+    ///
+    /// The message names the form that failed, such as an empty variable name
+    /// or a missing closing brace, and never repeats the surrounding value.
+    Syntax {
+        /// What is wrong with the reference.
+        message: String,
+    },
+    /// A `${NAME:?message}` reference had no value.
+    ///
+    /// The message is exactly what the caller wrote after `:?`, which is what
+    /// makes that form a way to supply the error text.
+    Required {
+        /// The caller-supplied message.
+        message: String,
+    },
+    /// The setter supplied for `${NAME:=default}` failed.
+    SetFailed {
+        /// The variable the setter was asked to store.
+        key: String,
+        /// The setter's own error text.
+        message: String,
+    },
+    /// A `$(command)` substitution could not run, or exited non-zero.
+    ///
+    /// The message is the exit status or the failure kind. The command and its
+    /// output are not echoed, because they can contain anything the caller's
+    /// environment contained.
+    CommandFailed {
+        /// Why the command failed.
+        message: String,
+    },
 }
 
 impl fmt::Display for EnvError {
@@ -250,6 +316,13 @@ impl fmt::Display for EnvError {
                 "{key:?} is not an environment variable name: a name starts with an ASCII letter \
                  or an underscore and continues with ASCII letters, digits or underscores"
             ),
+            Self::Syntax { message } | Self::Required { message } => formatter.write_str(message),
+            Self::SetFailed { key, message } => {
+                write!(formatter, "could not set {key:?}: {message}")
+            }
+            Self::CommandFailed { message } => {
+                write!(formatter, "command substitution failed: {message}")
+            }
         }
     }
 }
@@ -624,72 +697,128 @@ fn quote_single(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvDiff, EnvError, Environment, Platform, Result, Shell, expand, expand_with, path_append,
-        path_prepend,
+        EnvDiff, EnvError, Environment, Platform, Result, Shell, path_append, path_prepend,
     };
     use indexmap::indexmap;
+
     #[test]
-    fn fixture_interpolation_matches_config_behavior() {
+    fn get_set_unset_and_has_round_trip() {
         let mut environment = Environment::new(Platform::Unix);
-        environment.insert("NAME", "acme");
-        // Both separators are kept: the one after the unbraced `$NAME` and the
-        // one after the braced `${MISSING}`, which expands to nothing.
-        assert_eq!(expand("$NAME/${MISSING}/$", &environment), "acme//$");
-    }
-    /// Expands against a fixed set of values, so a test says what it expects
-    /// rather than which variable it happened to look up. Named apart from
-    /// [`expand`] so a call here is never mistaken for the crate's own.
-    fn expand_fixture(value: &str) -> String {
-        expand_with(value, |name| match name {
-            "HOME" => Some("/home/dev"),
-            "PATH" => Some("/usr/bin"),
-            _ => None,
-        })
-    }
-    #[test]
-    fn unbraced_name_keeps_the_character_that_ends_it() {
-        assert_eq!(expand_fixture("$HOME/bin"), "/home/dev/bin");
-        assert_eq!(expand_fixture("$HOME"), "/home/dev");
-        assert_eq!(expand_fixture("$PATH:/opt/bin"), "/usr/bin:/opt/bin");
+        assert!(!environment.has("ENV_TEST_KEY"));
+        assert_eq!(environment.get("ENV_TEST_KEY"), None);
+
+        assert_eq!(environment.insert("ENV_TEST_KEY", "test_value"), None);
+        assert!(environment.has("ENV_TEST_KEY"));
+        assert_eq!(environment.get("ENV_TEST_KEY"), Some("test_value"));
+
         assert_eq!(
-            expand_fixture("$HOME/bin:$PATH/x"),
-            "/home/dev/bin:/usr/bin/x"
+            environment.remove("ENV_TEST_KEY"),
+            Some("test_value".into())
         );
-        assert_eq!(expand_fixture("/opt/$HOME"), "/opt//home/dev");
+        assert!(!environment.has("ENV_TEST_KEY"));
+        assert_eq!(environment.get("ENV_TEST_KEY"), None);
     }
+
     #[test]
-    fn unbraced_name_ends_at_any_character_a_value_can_contain() {
-        // The last one is two bytes in UTF-8, so the list also says the name is
-        // delimited on a character boundary rather than a byte.
-        for terminator in [':', '/', '-', '.', ' ', '=', '\n', '\u{e9}'] {
-            let value = format!("$HOME{terminator}bin");
-            assert_eq!(
-                expand_fixture(&value),
-                format!("/home/dev{terminator}bin"),
-                "terminator {terminator:?} was swallowed"
-            );
-        }
+    fn an_empty_value_is_set_and_still_has_the_key() {
+        let mut environment = Environment::new(Platform::Unix);
+        environment.insert("EMPTY", "");
+        assert!(environment.has("EMPTY"));
+        assert_eq!(environment.get("EMPTY"), Some(""));
     }
+
     #[test]
-    fn a_missing_name_expands_to_nothing_and_keeps_its_neighbours() {
-        assert_eq!(expand_fixture("$MISSING/bin"), "/bin");
-        assert_eq!(expand_fixture("x${MISSING}y"), "xy");
+    fn as_map_lists_every_entry_in_insertion_order() {
+        let mut environment = Environment::new(Platform::Unix);
+        environment.insert("ENV_ALL_TEST", "all_value");
+        environment.insert("SECOND", "two");
+        assert_eq!(
+            environment.as_map().keys().collect::<Vec<_>>(),
+            ["ENV_ALL_TEST", "SECOND"]
+        );
+        assert_eq!(
+            environment.as_map().get("ENV_ALL_TEST").map(String::as_str),
+            Some("all_value")
+        );
     }
+
     #[test]
-    fn a_dollar_with_no_name_is_literal() {
-        assert_eq!(expand_fixture("$"), "$");
-        assert_eq!(expand_fixture("a$/b"), "a$/b");
-        assert_eq!(expand_fixture("$$"), "$$");
+    fn path_is_read_written_and_split() {
+        let mut environment = Environment::new(Platform::Unix);
+        environment.set_path("/tmp/testpath");
+        assert_eq!(environment.path(), "/tmp/testpath");
+        assert_eq!(environment.split_path(), ["/tmp/testpath"]);
+
+        let joined = Platform::Unix.join_path(["/a", "/b"]);
+        assert_eq!(joined, "/a:/b");
     }
+
     #[test]
-    fn a_braced_name_is_unchanged_by_the_terminator_fix() {
-        assert_eq!(expand_fixture("${HOME}/bin"), "/home/dev/bin");
-        assert_eq!(expand_fixture("${HOME}"), "/home/dev");
-        assert_eq!(expand_fixture("${MISSING}/bin"), "/bin");
-        // No closing brace: the rest of the value is the name, and it is not
-        // set, so the whole remainder expands to nothing.
-        assert_eq!(expand_fixture("${HOME/bin"), "");
+    fn prepend_append_and_has_path() {
+        let mut environment = Environment::new(Platform::Unix);
+        environment.set_path("");
+        assert!(!environment.has_path("/foo"));
+
+        assert!(environment.prepend_path("/foo"));
+        assert!(environment.has_path("/foo"));
+        assert_eq!(environment.split_path().first(), Some(&"/foo"));
+
+        assert!(environment.append_path("/bar"));
+        let paths = environment.split_path();
+        assert_eq!(paths.last(), Some(&"/bar"));
+        assert!(environment.has_path("/bar"));
     }
+
+    #[test]
+    fn prepend_and_append_leave_the_edge_entry_alone() {
+        let mut environment = Environment::new(Platform::Unix);
+        environment.set_path("/first:/last");
+        assert!(!environment.prepend_path("/first"));
+        assert!(!environment.append_path("/last"));
+        assert_eq!(environment.path(), "/first:/last");
+
+        // Only the edge is deduplicated, matching the Go package: an entry in
+        // the middle can still be added at either end.
+        assert!(environment.append_path("/first"));
+        assert_eq!(environment.path(), "/first:/last:/first");
+    }
+
+    #[test]
+    fn an_unset_path_reads_as_empty_and_composes_without_a_separator() {
+        let mut environment = Environment::new(Platform::Unix);
+        assert_eq!(environment.path(), "");
+        assert_eq!(environment.split_path(), [""]);
+        assert!(environment.prepend_path("/foo"));
+        assert_eq!(environment.path(), "/foo");
+    }
+
+    #[test]
+    fn windows_path_keys_and_entries_ignore_case() {
+        let mut environment = Environment::new(Platform::Windows);
+        environment.set_path(r"C:\Windows;C:\Tools");
+        assert_eq!(environment.get("PATH"), Some(r"C:\Windows;C:\Tools"));
+        assert_eq!(environment.get("path"), Some(r"C:\Windows;C:\Tools"));
+        assert_eq!(environment.split_path().len(), 2);
+        assert!(environment.has_path(r"c:\windows"));
+        assert!(environment.has_path(r"C:\TOOLS"));
+
+        // Only the edge is deduplicated, so an entry already at the front is
+        // left alone and an entry in the middle is added at the front.
+        assert!(!environment.prepend_path(r"c:\windows"));
+        assert_eq!(environment.path(), r"C:\Windows;C:\Tools");
+
+        assert!(environment.prepend_path(r"c:\tools"));
+        assert_eq!(environment.path(), r"c:\tools;C:\Windows;C:\Tools");
+    }
+
+    #[test]
+    fn the_path_separator_follows_the_platform() {
+        assert_eq!(Platform::Unix.path_separator(), ':');
+        assert_eq!(Platform::Windows.path_separator(), ';');
+        assert_eq!(Platform::Unix.path_key(), "PATH");
+        assert_eq!(Platform::Windows.path_key(), "Path");
+    }
+
     #[test]
     fn fixture_path_operations_preserve_declaration_order() {
         let entries = vec!["first".into(), "second".into()];
