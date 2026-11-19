@@ -5,10 +5,10 @@ It exists to keep environment planning deterministic and separate from process
 environment mutation.
 
 ```rust
-let home = neotales_env::interpolate_with("$HOME/bin", |key| {
+let home = neotales_env::expand_with("$HOME/bin", |key| {
     (key == "HOME").then_some("/home/dev")
 });
-let braced = neotales_env::interpolate_with("${HOME}/bin", |key| {
+let braced = neotales_env::expand_with("${HOME}/bin", |key| {
     (key == "HOME").then_some("/home/dev")
 });
 assert_eq!(home, "/home/dev/bin");

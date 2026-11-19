@@ -127,8 +127,8 @@ impl Environment {
 
 /// Expands `$NAME` and `${NAME}` using explicitly supplied values. Unset names are empty.
 #[must_use]
-pub fn interpolate(value: &str, environment: &Environment) -> String {
-    interpolate_with(value, |name| environment.get(name))
+pub fn expand(value: &str, environment: &Environment) -> String {
+    expand_with(value, |name| environment.get(name))
 }
 
 /// Expands `$NAME` and `${NAME}` using an explicit lookup function.
@@ -138,16 +138,13 @@ pub fn interpolate(value: &str, environment: &Environment) -> String {
 /// `$HOME/bin` rather than swallowing it into the name:
 ///
 /// ```
-/// use neotales_env::interpolate_with;
+/// use neotales_env::expand_with;
 ///
-/// let home = interpolate_with("$HOME/bin", |name| (name == "HOME").then_some("/home/dev"));
+/// let home = expand_with("$HOME/bin", |name| (name == "HOME").then_some("/home/dev"));
 /// assert_eq!(home, "/home/dev/bin");
 /// ```
 #[must_use]
-pub fn interpolate_with<'a>(
-    value: &str,
-    mut lookup: impl FnMut(&str) -> Option<&'a str>,
-) -> String {
+pub fn expand_with<'a>(value: &str, mut lookup: impl FnMut(&str) -> Option<&'a str>) -> String {
     let mut output = String::with_capacity(value.len());
     // `rest` is the part of `value` not yet copied, and it is always sliced
     // rather than iterated, so the character that ends a name is still at the
@@ -627,8 +624,8 @@ fn quote_single(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvDiff, EnvError, Environment, Platform, Result, Shell, interpolate, interpolate_with,
-        path_append, path_prepend,
+        EnvDiff, EnvError, Environment, Platform, Result, Shell, expand, expand_with, path_append,
+        path_prepend,
     };
     use indexmap::indexmap;
     #[test]
@@ -637,12 +634,13 @@ mod tests {
         environment.insert("NAME", "acme");
         // Both separators are kept: the one after the unbraced `$NAME` and the
         // one after the braced `${MISSING}`, which expands to nothing.
-        assert_eq!(interpolate("$NAME/${MISSING}/$", &environment), "acme//$");
+        assert_eq!(expand("$NAME/${MISSING}/$", &environment), "acme//$");
     }
     /// Expands against a fixed set of values, so a test says what it expects
-    /// rather than which variable it happened to look up.
-    fn expand(value: &str) -> String {
-        interpolate_with(value, |name| match name {
+    /// rather than which variable it happened to look up. Named apart from
+    /// [`expand`] so a call here is never mistaken for the crate's own.
+    fn expand_fixture(value: &str) -> String {
+        expand_with(value, |name| match name {
             "HOME" => Some("/home/dev"),
             "PATH" => Some("/usr/bin"),
             _ => None,
@@ -650,11 +648,14 @@ mod tests {
     }
     #[test]
     fn unbraced_name_keeps_the_character_that_ends_it() {
-        assert_eq!(expand("$HOME/bin"), "/home/dev/bin");
-        assert_eq!(expand("$HOME"), "/home/dev");
-        assert_eq!(expand("$PATH:/opt/bin"), "/usr/bin:/opt/bin");
-        assert_eq!(expand("$HOME/bin:$PATH/x"), "/home/dev/bin:/usr/bin/x");
-        assert_eq!(expand("/opt/$HOME"), "/opt//home/dev");
+        assert_eq!(expand_fixture("$HOME/bin"), "/home/dev/bin");
+        assert_eq!(expand_fixture("$HOME"), "/home/dev");
+        assert_eq!(expand_fixture("$PATH:/opt/bin"), "/usr/bin:/opt/bin");
+        assert_eq!(
+            expand_fixture("$HOME/bin:$PATH/x"),
+            "/home/dev/bin:/usr/bin/x"
+        );
+        assert_eq!(expand_fixture("/opt/$HOME"), "/opt//home/dev");
     }
     #[test]
     fn unbraced_name_ends_at_any_character_a_value_can_contain() {
@@ -663,7 +664,7 @@ mod tests {
         for terminator in [':', '/', '-', '.', ' ', '=', '\n', '\u{e9}'] {
             let value = format!("$HOME{terminator}bin");
             assert_eq!(
-                expand(&value),
+                expand_fixture(&value),
                 format!("/home/dev{terminator}bin"),
                 "terminator {terminator:?} was swallowed"
             );
@@ -671,23 +672,23 @@ mod tests {
     }
     #[test]
     fn a_missing_name_expands_to_nothing_and_keeps_its_neighbours() {
-        assert_eq!(expand("$MISSING/bin"), "/bin");
-        assert_eq!(expand("x${MISSING}y"), "xy");
+        assert_eq!(expand_fixture("$MISSING/bin"), "/bin");
+        assert_eq!(expand_fixture("x${MISSING}y"), "xy");
     }
     #[test]
     fn a_dollar_with_no_name_is_literal() {
-        assert_eq!(expand("$"), "$");
-        assert_eq!(expand("a$/b"), "a$/b");
-        assert_eq!(expand("$$"), "$$");
+        assert_eq!(expand_fixture("$"), "$");
+        assert_eq!(expand_fixture("a$/b"), "a$/b");
+        assert_eq!(expand_fixture("$$"), "$$");
     }
     #[test]
     fn a_braced_name_is_unchanged_by_the_terminator_fix() {
-        assert_eq!(expand("${HOME}/bin"), "/home/dev/bin");
-        assert_eq!(expand("${HOME}"), "/home/dev");
-        assert_eq!(expand("${MISSING}/bin"), "/bin");
+        assert_eq!(expand_fixture("${HOME}/bin"), "/home/dev/bin");
+        assert_eq!(expand_fixture("${HOME}"), "/home/dev");
+        assert_eq!(expand_fixture("${MISSING}/bin"), "/bin");
         // No closing brace: the rest of the value is the name, and it is not
         // set, so the whole remainder expands to nothing.
-        assert_eq!(expand("${HOME/bin"), "");
+        assert_eq!(expand_fixture("${HOME/bin"), "");
     }
     #[test]
     fn fixture_path_operations_preserve_declaration_order() {
