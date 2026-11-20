@@ -87,11 +87,39 @@ impl Platform {
             Self::Windows => left.eq_ignore_ascii_case(right),
         }
     }
+
+    /// Compares two `PATH` entries under this platform's rules.
+    ///
+    /// This is the rule [`Self::keys_equal`] applies to environment names:
+    /// Windows compares without regard to case, and every other platform
+    /// compares the exact bytes. It is a separate method so that path
+    /// membership never picks up a change made to name handling, and so that
+    /// Unix entries are never folded to a canonical spelling.
+    fn entries_equal(self, left: &str, right: &str) -> bool {
+        self.keys_equal(left, right)
+    }
 }
 
-/// Prepends entries in declaration order, preserving an empty existing value as absent.
+/// Prepends `entries` to `existing` for `platform`, without touching the process.
+///
+/// This is the pure counterpart of the process-level [`prepend_path`]: the
+/// caller supplies the current value and gets the composed value back, so the
+/// function is safe to call from a test or while another thread owns the
+/// environment. Entries keep their declaration order, and an unset or empty
+/// `existing` is treated as having no entries, so no separator is left behind.
+///
+/// ```
+/// use neotales_env::{Platform, prepend_path_platform};
+///
+/// let value = prepend_path_platform(Some("/usr/bin"), &["/opt/bin".to_owned()], Platform::Unix);
+/// assert_eq!(value, "/opt/bin:/usr/bin");
+/// ```
 #[must_use]
-pub fn path_prepend(existing: Option<&str>, entries: &[String], platform: Platform) -> String {
+pub fn prepend_path_platform(
+    existing: Option<&str>,
+    entries: &[String],
+    platform: Platform,
+) -> String {
     platform.join_path(
         entries
             .iter()
@@ -100,9 +128,26 @@ pub fn path_prepend(existing: Option<&str>, entries: &[String], platform: Platfo
     )
 }
 
-/// Appends entries in declaration order, preserving an empty existing value as absent.
+/// Appends `entries` to `existing` for `platform`, without touching the process.
+///
+/// This is the pure counterpart of the process-level [`append_path`]: the
+/// caller supplies the current value and gets the composed value back, so the
+/// function is safe to call from a test or while another thread owns the
+/// environment. Entries keep their declaration order, and an unset or empty
+/// `existing` is treated as having no entries, so no separator is left behind.
+///
+/// ```
+/// use neotales_env::{Platform, append_path_platform};
+///
+/// let value = append_path_platform(Some("/usr/bin"), &["/opt/bin".to_owned()], Platform::Unix);
+/// assert_eq!(value, "/usr/bin:/opt/bin");
+/// ```
 #[must_use]
-pub fn path_append(existing: Option<&str>, entries: &[String], platform: Platform) -> String {
+pub fn append_path_platform(
+    existing: Option<&str>,
+    entries: &[String],
+    platform: Platform,
+) -> String {
     platform.join_path(
         existing
             .filter(|value| !value.is_empty())
@@ -259,13 +304,15 @@ pub enum EnvChange {
 /// A shell a diff can be rendered for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shell {
+    /// A POSIX `sh`, whose `export` and `unset` forms the other POSIX shells share.
+    Sh,
     /// GNU Bash.
     Bash,
     /// Zsh.
     Zsh,
     /// Fish, whose quoting differs from the POSIX shells.
     Fish,
-    /// Windows PowerShell and PowerShell Core.
+    /// Windows PowerShell and PowerShell Core, also invoked as `pwsh`.
     PowerShell,
     /// Nushell, which is not a POSIX shell and takes list syntax.
     Nushell,
@@ -274,11 +321,14 @@ pub enum Shell {
 impl Shell {
     /// Parses a shell name, accepting the common aliases.
     ///
-    /// Returns `None` for anything unrecognised, so a caller can report the value
-    /// it was given rather than silently rendering for the wrong shell.
+    /// `pwsh` selects the same variant as `powershell`, because PowerShell Core
+    /// shares the syntax rendered for Windows PowerShell. Returns `None` for
+    /// anything unrecognised, so a caller can report the value it was given
+    /// rather than silently rendering for the wrong shell.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "sh" => Some(Self::Sh),
             "bash" => Some(Self::Bash),
             "zsh" => Some(Self::Zsh),
             "fish" => Some(Self::Fish),
@@ -460,7 +510,7 @@ fn apply_change(environment: &mut IndexMap<String, String>, change: &EnvChange) 
             environment.shift_remove(key);
         }
         EnvChange::PathPrepend { key, value } => {
-            let value = path_prepend(
+            let value = prepend_path_platform(
                 environment.get(key).map(String::as_str),
                 std::slice::from_ref(value),
                 Platform::host(),
@@ -468,7 +518,7 @@ fn apply_change(environment: &mut IndexMap<String, String>, change: &EnvChange) 
             environment.insert(key.clone(), value);
         }
         EnvChange::PathAppend { key, value } => {
-            let value = path_append(
+            let value = append_path_platform(
                 environment.get(key).map(String::as_str),
                 std::slice::from_ref(value),
                 Platform::host(),
@@ -481,7 +531,10 @@ fn apply_change(environment: &mut IndexMap<String, String>, change: &EnvChange) 
 fn render_change(change: &EnvChange, shell: Shell) -> String {
     let key = change.key();
     match shell {
-        Shell::Bash | Shell::Zsh => match change {
+        // A plain POSIX shell takes the same `export` and `unset` forms as Bash
+        // and Zsh, and the expansions below (`${name:-}`, `${name:+...}`) are
+        // POSIX parameter expansions rather than Bash extensions.
+        Shell::Sh | Shell::Bash | Shell::Zsh => match change {
             EnvChange::Set { value, .. } => format!("export {key}={}", quote_posix(value)),
             EnvChange::Unset { .. } => format!("unset {key}"),
             EnvChange::PathPrepend { value, .. } => {
@@ -558,7 +611,9 @@ fn quote_single(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvDiff, EnvError, Platform, Result, Shell, path_append, path_prepend};
+    use super::{
+        EnvDiff, EnvError, Platform, Result, Shell, append_path_platform, prepend_path_platform,
+    };
     use indexmap::indexmap;
 
     #[test]
@@ -570,15 +625,48 @@ mod tests {
     }
 
     #[test]
+    fn path_entries_compare_by_the_platform_case_rule() {
+        // Windows folds case, so the same directory spelled two ways matches.
+        assert!(Platform::Windows.entries_equal(r"C:\Tools", r"c:\tools"));
+        // Unix does not, and nothing normalises the entry to a canonical
+        // spelling first, which would make these two match.
+        assert!(!Platform::Unix.entries_equal("/Tools", "/tools"));
+        assert!(Platform::Unix.entries_equal("/tools", "/tools"));
+        // The entry rule is the key rule, not the `path_key` spelling.
+        assert!(Platform::Windows.entries_equal("Path", "PATH"));
+        assert!(!Platform::Unix.entries_equal("Path", "PATH"));
+    }
+
+    /// The environment-name rule behind `has_var`, checked on both platforms
+    /// explicitly so the expectation does not depend on the runner.
+    #[test]
+    fn environment_keys_compare_by_the_platform_case_rule() {
+        assert!(Platform::Windows.keys_equal("Path", "PATH"));
+        assert!(Platform::Windows.keys_equal("neotales_env_test", "NEOTALES_ENV_TEST"));
+        assert!(!Platform::Unix.keys_equal("Path", "PATH"));
+        assert!(!Platform::Unix.keys_equal("neotales_env_test", "NEOTALES_ENV_TEST"));
+        assert!(Platform::Unix.keys_equal("PATH", "PATH"));
+    }
+
+    #[test]
     fn fixture_path_operations_preserve_declaration_order() {
         let entries = vec!["first".into(), "second".into()];
         assert_eq!(
-            path_prepend(Some("system"), &entries, Platform::Unix),
+            prepend_path_platform(Some("system"), &entries, Platform::Unix),
             "first:second:system"
         );
         assert_eq!(
-            path_append(Some("system"), &entries, Platform::Windows),
+            append_path_platform(Some("system"), &entries, Platform::Windows),
             "system;first;second"
+        );
+        // An empty existing value is absent, not an empty entry.
+        assert_eq!(
+            prepend_path_platform(Some(""), &entries, Platform::Unix),
+            "first:second"
+        );
+        assert_eq!(
+            append_path_platform(Some(""), &entries, Platform::Unix),
+            "first:second"
         );
     }
     #[test]
@@ -600,11 +688,51 @@ mod tests {
         let mut diff = EnvDiff::new();
         diff.set("VALUE", "a'$(unsafe)")?
             .path_prepend("PATH", "/opt tool")?;
+        assert!(diff.render(Shell::Sh).contains("'a'\"'\"'$(unsafe)'"));
         assert!(diff.render(Shell::Bash).contains("'a'\"'\"'$(unsafe)'"));
         assert!(diff.render(Shell::Zsh).contains("'a'\"'\"'$(unsafe)'"));
         assert!(diff.render(Shell::Fish).contains("'a'\"'\"'$(unsafe)'"));
         assert!(diff.render(Shell::PowerShell).contains("'a''$(unsafe)'"));
         assert!(diff.render(Shell::Nushell).contains("'a''$(unsafe)'"));
+        Ok(())
+    }
+
+    /// A plain POSIX shell gets `export` and `unset`, and only POSIX parameter
+    /// expansions, so the output runs under `dash` as well as `bash`.
+    #[test]
+    fn sh_renders_every_change_as_posix() -> Result<()> {
+        let mut diff = EnvDiff::new();
+        diff.set("MODE", "release")?
+            .unset("OLD")?
+            .path_prepend("PATH", "/opt/bin")?
+            .path_append("LD_LIBRARY_PATH", "/opt/lib")?;
+        let expected = "export MODE='release'\n\
+                        unset OLD\n\
+                        export PATH='/opt/bin':\"${PATH:-}\"\n\
+                        export LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}\"'/opt/lib'";
+        assert_eq!(diff.render(Shell::Sh), expected);
+        assert_eq!(Shell::parse("sh"), Some(Shell::Sh));
+        Ok(())
+    }
+
+    /// PowerShell is its own shell, aliased by `pwsh`, and never rendered with
+    /// the POSIX forms Bash and `sh` use.
+    #[test]
+    fn powershell_renders_every_change_for_both_names() -> Result<()> {
+        let mut diff = EnvDiff::new();
+        diff.set("MODE", "release")?
+            .unset("OLD")?
+            .path_prepend("PATH", "/opt/bin")?
+            .path_append("LD_LIBRARY_PATH", "/opt/lib")?;
+        let expected = "$env:MODE = 'release'\n\
+                        Remove-Item Env:OLD -ErrorAction SilentlyContinue\n\
+                        $env:PATH = '/opt/bin' + [IO.Path]::PathSeparator + $env:PATH\n\
+                        $env:LD_LIBRARY_PATH = $env:LD_LIBRARY_PATH + [IO.Path]::PathSeparator + '/opt/lib'";
+        assert_eq!(diff.render(Shell::PowerShell), expected);
+        assert_eq!(Shell::parse("powershell"), Some(Shell::PowerShell));
+        assert_eq!(Shell::parse("pwsh"), Some(Shell::PowerShell));
+        assert_ne!(Shell::parse("sh"), Some(Shell::PowerShell));
+        assert_eq!(Shell::parse("dash"), None);
         Ok(())
     }
 
@@ -650,6 +778,7 @@ mod tests {
                        $env.PATH = ['/opt/bin'] ++ ($env.PATH? | default [])\n\
                        $env.LD_LIBRARY_PATH = ($env.LD_LIBRARY_PATH? | default []) ++ ['/opt/lib']\n\
                        $env.QUOTED = 'a''$(unsafe) \"x\"'";
+        assert_eq!(diff.render(Shell::Sh), bash);
         assert_eq!(diff.render(Shell::Bash), bash);
         assert_eq!(diff.render(Shell::Zsh), bash);
         assert_eq!(diff.render(Shell::Fish), fish);

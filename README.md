@@ -70,19 +70,30 @@ let mut options = ExpandOptions::new()
 assert_eq!(options.expand("%HOME%/bin").unwrap(), "/home/dev/bin");
 ```
 
-**Compose a `PATH` without the process.** `Platform` supplies the separator and the case rules; the helpers return a new string.
+**Compose a `PATH` without the process.** `Platform` supplies the separator and the case rules; `prepend_path_platform` and `append_path_platform` return a new string.
 
 ```rust
-use neotales_env::{Platform, path_append, path_prepend};
+use neotales_env::{Platform, append_path_platform, prepend_path_platform};
 
-let path = path_prepend(Some("/usr/bin"), &["/opt/bin".to_owned()], Platform::Unix);
+let path = prepend_path_platform(Some("/usr/bin"), &["/opt/bin".to_owned()], Platform::Unix);
 assert_eq!(path, "/opt/bin:/usr/bin");
 
-let path = path_append(Some(&path), &["/usr/local/bin".to_owned()], Platform::Unix);
+let path = append_path_platform(Some(&path), &["/usr/local/bin".to_owned()], Platform::Unix);
 assert_eq!(path, "/opt/bin:/usr/bin:/usr/local/bin");
 ```
 
-**Change the process environment when you mean to.** These crate-root functions edit the process; the helpers above and the custom callbacks stay in memory. The process functions also come as `unset_var`, `set_path`, `append_path`, `has_var` and `vars`.
+**Render for the shell that will run it.** `Shell::Sh`, `Shell::Bash`, `Shell::Zsh`, `Shell::Fish`, `Shell::PowerShell` (also named `pwsh`) and `Shell::Nushell` each get their own syntax, and `Shell::parse` turns a shell name into a variant.
+
+```rust
+use neotales_env::{EnvDiff, Shell};
+
+let mut diff = EnvDiff::new();
+diff.path_prepend("PATH", "/opt/bin").unwrap();
+assert_eq!(diff.render(Shell::Sh), "export PATH='/opt/bin':\"${PATH:-}\"");
+assert_eq!(diff.render(Shell::PowerShell), "$env:PATH = '/opt/bin' + [IO.Path]::PathSeparator + $env:PATH");
+```
+
+**Change the process environment when you mean to.** These crate-root functions edit the process; the helpers above and the custom callbacks stay in memory. The process functions also come as `unset_var`, `set_path`, `append_path`, `has_var` and `vars`. `has_var` and `has_path` follow `Platform::host()`: Windows ignores case for variable names and for `PATH` entries, while every other platform compares both exactly, so `/Tools` and `/tools` are different entries on Unix.
 
 ```rust
 use neotales_env::{get_var, has_path, prepend_path, set_var};

@@ -15,7 +15,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use indexmap::IndexMap;
 
-use crate::{EnvError, Platform, Result, path_append, path_prepend, validate_key};
+use crate::{
+    EnvError, Platform, Result, append_path_platform, prepend_path_platform, validate_key,
+};
 
 /// Serializes this crate's own process-environment access.
 ///
@@ -80,6 +82,9 @@ fn remove_variable(key: &str) -> Result<()> {
 /// [`has_var`] when the question is whether the name exists. A name this
 /// platform cannot query, or a value that is not valid Unicode, is `None`.
 ///
+/// Name matching follows the operating system, exactly as [`has_var`]
+/// describes: case-insensitive on Windows, case-sensitive elsewhere.
+///
 /// This reads the calling process's environment. The crate serializes its own
 /// calls with a private mutex, but the caller must not mutate the environment
 /// from another thread while this runs, for the reason `std::env::var_os`
@@ -122,6 +127,15 @@ pub fn set_var(key: &str, value: &str) -> Result<()> {
 /// This includes a variable whose value is empty, and unlike [`get_var`] it says
 /// nothing about whether the value is Unicode.
 ///
+/// Name matching is the operating system's rule, which is the rule [`Platform`]
+/// records: Windows environment names are case-insensitive, so `has_var("Path")`
+/// is true when only `PATH` is set, while every other platform compares the
+/// exact bytes, so `has_var("path")` is false when only `PATH` is set.
+/// [`std::env::var_os`] asks the operating system, so nothing here folds case
+/// that the platform would not fold itself. [`vars`] lists the spellings the
+/// operating system supplies; a Windows environment block can collapse two
+/// case spellings of one name into a single entry.
+///
 /// This reads the calling process's environment. The crate serializes its own
 /// calls with a private mutex, but the caller must not mutate the environment
 /// from another thread while this runs.
@@ -156,7 +170,9 @@ pub fn unset_var(key: &str) -> Result<()> {
 /// `=` is kept: the operating system already supplies the pair split at the
 /// first `=` in the entry. Pairs that are not valid Unicode on either side are
 /// skipped rather than causing a panic. If the platform supplies the same key
-/// twice, the last value wins and the first position is kept.
+/// twice, the last value wins and the first position is kept. On Windows, where
+/// names are case-insensitive, two case spellings of one name are one entry to
+/// the operating system, so the map holds the single entry the OS supplies.
 ///
 /// This reads the calling process's environment. The crate serializes its own
 /// calls with a private mutex, but the caller must not mutate the environment
@@ -221,12 +237,12 @@ pub fn prepend_path(entry: &str) -> Result<()> {
         value
             .split(platform.path_separator())
             .next()
-            .is_some_and(|first| platform.keys_equal(first, entry))
+            .is_some_and(|first| platform.entries_equal(first, entry))
     });
     if already_first {
         return Ok(());
     }
-    let value = path_prepend(
+    let value = prepend_path_platform(
         current.as_deref(),
         std::slice::from_ref(&entry.to_owned()),
         platform,
@@ -256,12 +272,12 @@ pub fn append_path(entry: &str) -> Result<()> {
         value
             .split(platform.path_separator())
             .next_back()
-            .is_some_and(|last| platform.keys_equal(last, entry))
+            .is_some_and(|last| platform.entries_equal(last, entry))
     });
     if already_last {
         return Ok(());
     }
-    let value = path_append(
+    let value = append_path_platform(
         current.as_deref(),
         std::slice::from_ref(&entry.to_owned()),
         platform,
@@ -273,7 +289,14 @@ pub fn append_path(entry: &str) -> Result<()> {
 ///
 /// This is `false` when `PATH` is unset. Empty entries never match, so an empty
 /// entry left by a trailing separator cannot be found by a query such as
-/// `has_path("")`. Windows compares entries without regard to case.
+/// `has_path("")`.
+///
+/// Entries are compared by the rules of [`Platform::host()`], the same rule
+/// [`has_var`] applies to names: Windows ignores case, so `C:\Tools` and
+/// `c:\tools` are the same entry, while every other platform compares the exact
+/// bytes, so `/Tools` and `/tools` are different entries. The comparison is on
+/// entries, not on the variable name, and a Unix entry is never folded to a
+/// canonical spelling before it is compared.
 ///
 /// This reads the calling process's environment. The crate serializes its own
 /// calls with a private mutex, but the caller must not mutate the environment
@@ -287,7 +310,7 @@ pub fn has_path(entry: &str) -> bool {
     };
     current
         .split(platform.path_separator())
-        .any(|existing| !existing.is_empty() && platform.keys_equal(existing, entry))
+        .any(|existing| !existing.is_empty() && platform.entries_equal(existing, entry))
 }
 
 #[cfg(test)]
@@ -344,6 +367,8 @@ mod tests {
     }
 
     const KEY: &str = "NEOTALES_ENV_TEST_VALUE";
+    /// The same name as [`KEY`] in another case, for the case-rule test.
+    const LOWER_KEY: &str = "neotales_env_test_value";
     const EMPTY_KEY: &str = "NEOTALES_ENV_TEST_EMPTY";
     const EQUALS_KEY: &str = "NEOTALES_ENV_TEST_EQUALS";
     const EXPAND_KEY: &str = "NEOTALES_ENV_TEST_EXPAND";
@@ -366,6 +391,29 @@ mod tests {
         unset_var(KEY).unwrap();
         assert_eq!(get_var(KEY), None);
         assert!(!has_var(KEY));
+    }
+
+    /// The process name lookup follows the operating system, which is the rule
+    /// `Platform::host()` records. The variable is written once and queried in
+    /// another case, so a regression to unconditional folding (or to none)
+    /// fails on at least one platform.
+    #[test]
+    fn has_var_uses_the_host_platform_case_rule() {
+        let _guard = test_lock();
+        let mut restore = Restore::capture();
+        restore.track(KEY);
+        restore.track(LOWER_KEY);
+        let _ = unset_var(LOWER_KEY);
+        let _ = unset_var(KEY);
+
+        set_var(KEY, "value").unwrap();
+        assert!(has_var(KEY));
+        match Platform::host() {
+            // `std::env::var_os` asks the OS, and Windows names ignore case.
+            Platform::Windows => assert!(has_var(LOWER_KEY)),
+            Platform::Unix => assert!(!has_var(LOWER_KEY)),
+        }
+        assert_eq!(get_var(LOWER_KEY).is_some(), has_var(LOWER_KEY));
     }
 
     #[test]
@@ -454,6 +502,34 @@ mod tests {
         assert_eq!(get_var(platform.path_key()), None);
         assert!(!has_path("/anything"));
         assert!(!has_path(""));
+    }
+
+    /// The process query follows `Platform::host()`, so the expectation is
+    /// conditional: Windows folds case, every other platform does not. The
+    /// entry is written in the platform's own `PATH` spelling, and the query
+    /// differs only in case, which is the whole assertion.
+    #[test]
+    fn has_path_uses_the_host_platform_case_rule() {
+        let _guard = test_lock();
+        let _restore = Restore::capture();
+        let platform = super::Platform::host();
+
+        match platform {
+            super::Platform::Windows => {
+                set_path(r"C:\Tools").unwrap();
+                assert!(has_path(r"C:\Tools"));
+                assert!(has_path(r"c:\tools"));
+            }
+            super::Platform::Unix => {
+                set_path("/Tools").unwrap();
+                assert!(has_path("/Tools"));
+                assert!(!has_path("/tools"));
+                // A same-spelling entry is still found after the case check
+                // above, so the negative is about case and not about listing.
+                set_path("/tools").unwrap();
+                assert!(has_path("/tools"));
+            }
+        }
     }
 
     #[test]
