@@ -11,6 +11,8 @@ readme = "README.md"
 keywords = ["environment", "dotenv", "path", "shell", "interpolation"]
 categories = ["command-line-interface", "config"]
 
+exclude = ["src/env.rs.bck"]
+
 [dependencies]
 indexmap = { version = "2.12", features = ["serde"] }
 
