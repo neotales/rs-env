@@ -2,33 +2,39 @@
 //! `$(…)`.
 //!
 //! The parser works on characters, so a value written in any UTF-8 encoding is
-//! sliced on character boundaries. Every lookup and every store comes from the
-//! caller through [`ExpandOptions`]; nothing here reads or writes the process
+//! sliced on character boundaries. Every lookup and every store goes through
+//! [`ExpandOptions`]; the parser itself never reads or writes the process
 //! environment.
 
 use std::fmt;
 use std::process::Command;
 
-use crate::{EnvError, Environment, Result};
+use crate::{EnvError, Result};
 
-type Lookup<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
+type Getter<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 type Setter<'a> = Box<dyn FnMut(&str, &str) -> std::result::Result<(), String> + 'a>;
 
-/// How [`expand_with_options`] finds and stores values.
+/// How [`expand`] finds and stores values.
 ///
-/// The type is a builder. Its defaults match the Go `env` package's `Expand`:
-/// command substitution is off, Windows `%NAME%` references are off, `$$` is a
-/// literal `$`, and `\$` is a literal `$`.
+/// [`ExpandOptions::new`] reads with [`get_var`](crate::get_var) and stores with
+/// [`set_var`](crate::set_var), so its defaults read and write the calling
+/// process's environment. [`with_get`](Self::with_get) and
+/// [`with_set`](Self::with_set) replace either callback completely; a replaced
+/// callback does not consult the process.
+///
+/// Everything else matches the Go `env` package's `Expand`: command
+/// substitution is off, Windows `%NAME%` references are off, `$$` is a literal
+/// `$`, and `\$` is a literal `$`.
 ///
 /// The forms accepted, in `value`:
 ///
-/// - `$NAME` and `${NAME}`, looked up in the supplied lookup. A name in the
+/// - `$NAME` and `${NAME}`, looked up through the getter. A name in the
 ///   unbraced form is a run of letters, digits and underscores, so `$HOME/bin`
 ///   keeps its slash. A name that is not set expands to nothing.
 /// - `${NAME:-default}`, which uses `default` when the value is missing or
 ///   empty. A `$` inside the default is expanded too.
 /// - `${NAME:=default}`, which is `${NAME:-default}` and also stores the
-///   default through the setter when one was supplied.
+///   default through the setter.
 /// - `${NAME:?message}`, which is an error carrying exactly `message` when the
 ///   value is missing or empty.
 /// - `${NAME:default}`, the same as `${NAME:-default}`.
@@ -44,19 +50,14 @@ type Setter<'a> = Box<dyn FnMut(&str, &str) -> std::result::Result<(), String> +
 /// ```
 /// use neotales_env::ExpandOptions;
 ///
-/// let mut options = ExpandOptions::new(|name| {
+/// let mut options = ExpandOptions::new().with_get(|name| {
 ///     (name == "HOME").then(|| "/home/dev".to_owned())
-/// })
-/// .with_windows_variables(true);
-///
-/// assert_eq!(
-///     options.expand("%HOME%/bin").unwrap(),
-///     "/home/dev/bin"
-/// );
+/// });
+/// assert_eq!(options.expand("$HOME/bin").unwrap(), "/home/dev/bin");
 /// ```
 pub struct ExpandOptions<'a> {
-    lookup: Lookup<'a>,
-    set: Option<Setter<'a>>,
+    get: Getter<'a>,
+    set: Setter<'a>,
     windows_variables: bool,
     command_substitution: bool,
     unix_args: Option<Vec<String>>,
@@ -70,21 +71,33 @@ impl fmt::Debug for ExpandOptions<'_> {
             .field("windows_variables", &self.windows_variables)
             .field("command_substitution", &self.command_substitution)
             .field("unix_args", &self.unix_args)
-            .field("set", &self.set.is_some())
             .finish_non_exhaustive()
     }
 }
 
+impl Default for ExpandOptions<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> ExpandOptions<'a> {
-    /// Creates options that read values from `lookup`.
+    /// Creates options backed by the process environment.
     ///
-    /// Everything else starts at the Go `Expand` defaults: Windows variables
-    /// and command substitution are off, and no positional arguments exist.
+    /// Reads call [`get_var`](crate::get_var) and `${NAME:=default}` stores
+    /// through [`set_var`](crate::set_var). Windows variables and command
+    /// substitution are off, and no positional arguments exist.
+    ///
+    /// This is the only constructor that touches the process implicitly. Use
+    /// [`with_get`](Self::with_get) or [`with_set`](Self::with_set) to replace
+    /// either side.
     #[must_use]
-    pub fn new(lookup: impl FnMut(&str) -> Option<String> + 'a) -> Self {
+    pub fn new() -> Self {
         Self {
-            lookup: Box::new(lookup),
-            set: None,
+            get: Box::new(crate::get_var),
+            set: Box::new(|key, value| {
+                crate::set_var(key, value).map_err(|error| error.to_string())
+            }),
             windows_variables: false,
             command_substitution: false,
             unix_args: None,
@@ -92,26 +105,28 @@ impl<'a> ExpandOptions<'a> {
         }
     }
 
-    /// Creates options that read values from `environment`.
+    /// Replaces the lookup used for `$NAME` and `${NAME}`.
     ///
-    /// There is no setter, so `${NAME:=default}` returns the default without
-    /// storing it.
+    /// The default is [`get_var`](crate::get_var). Returning `None` means the
+    /// name is unset and expands to nothing.
     #[must_use]
-    pub fn from_environment(environment: &'a Environment) -> Self {
-        Self::new(move |name| environment.get(name).map(str::to_owned))
+    pub fn with_get(mut self, get: impl FnMut(&str) -> Option<String> + 'a) -> Self {
+        self.get = Box::new(get);
+        self
     }
 
-    /// Supplies the function that `${NAME:=default}` calls to store a default.
+    /// Replaces the function that `${NAME:=default}` calls to store a default.
     ///
-    /// The function receives the name and the default, and its error text is
-    /// reported as [`EnvError::SetFailed`] with the name attached. It is only
-    /// called when the value is missing or empty.
+    /// The default is [`set_var`](crate::set_var), so the default options write
+    /// the process environment. The function receives the name and the default,
+    /// and its error text is reported as [`EnvError::SetFailed`] with the name
+    /// attached. It is only called when the value is missing or empty.
     #[must_use]
     pub fn with_set(
         mut self,
         set: impl FnMut(&str, &str) -> std::result::Result<(), String> + 'a,
     ) -> Self {
-        self.set = Some(Box::new(set));
+        self.set = Box::new(set);
         self
     }
 
@@ -149,49 +164,59 @@ impl<'a> ExpandOptions<'a> {
 
     /// Expands `value` with these options.
     ///
+    /// Reads and writes go through the configured callbacks. With
+    /// [`ExpandOptions::new`] that means the process environment; with custom
+    /// callbacks it means whatever they touch. No process-wide lock is held
+    /// across the expansion, so a default callback locks only for its own call.
+    ///
     /// # Errors
     ///
     /// Returns [`EnvError::Syntax`] for an unterminated reference or a name a
     /// shell would reject, [`EnvError::Required`] for `${NAME:?message}`,
-    /// [`EnvError::SetFailed`] when the supplied setter fails, and
+    /// [`EnvError::SetFailed`] when the configured setter fails, and
     /// [`EnvError::CommandFailed`] when a substituted command cannot run or
     /// exits non-zero.
     pub fn expand(&mut self, value: &str) -> Result<String> {
-        expand_with_options(value, self)
+        let characters: Vec<char> = value.chars().collect();
+        expand_characters(&characters, self)
     }
 }
 
-/// Expands `value` using `environment` for lookups.
+/// Expands `value` with `options`.
 ///
-/// Windows `%NAME%` references and command substitution stay off; build an
-/// [`ExpandOptions`] when either is wanted. There is no setter here, so
-/// `${NAME:=default}` returns the default without storing it.
+/// The options are consumed; call [`ExpandOptions::expand`] to reuse one.
+/// [`ExpandOptions::new`] reads the process with [`get_var`](crate::get_var) and
+/// writes `${NAME:=default}` with [`set_var`](crate::set_var). That is the
+/// default behaviour and it does change the calling process; custom callbacks
+/// fully replace it. Each default callback takes the process lock for its own
+/// call, so no lock is held across the expansion.
 ///
 /// # Errors
 ///
 /// Returns [`EnvError::Syntax`] when a reference is unterminated or names a
-/// variable a shell would reject, and [`EnvError::Required`] for a
-/// `${NAME:?message}` whose value is missing or empty.
+/// variable a shell would reject, [`EnvError::Required`] for a
+/// `${NAME:?message}` whose value is missing or empty, [`EnvError::SetFailed`]
+/// when the configured setter fails, and [`EnvError::CommandFailed`] when a
+/// substituted command cannot run or exits non-zero.
 ///
 /// ```
-/// use neotales_env::{Environment, Platform, expand};
+/// use neotales_env::{ExpandOptions, expand, set_var};
 ///
-/// let mut environment = Environment::new(Platform::Unix);
-/// environment.set("HOME", "/home/dev");
-///
-/// assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
-/// assert_eq!(expand("${MISSING:-/root}", &environment).unwrap(), "/root");
+/// set_var("NEOTALES_ENV_EXPAND_HOME", "/home/dev").unwrap();
+/// assert_eq!(
+///     expand("$NEOTALES_ENV_EXPAND_HOME/bin", ExpandOptions::new()).unwrap(),
+///     "/home/dev/bin"
+/// );
 /// ```
-pub fn expand(value: &str, environment: &Environment) -> Result<String> {
-    let mut options = ExpandOptions::from_environment(environment);
-    expand_with_options(value, &mut options)
+pub fn expand(value: &str, mut options: ExpandOptions<'_>) -> Result<String> {
+    options.expand(value)
 }
 
-/// Expands `value` using an explicit lookup.
+/// Expands `value` using an explicit lookup and no process access.
 ///
-/// The lookup covers every form that has no setter; see [`ExpandOptions`] for
-/// the full grammar. An unset name is empty. Because no setter is supplied,
-/// `${NAME:=default}` returns the default without storing it.
+/// An unset name is empty. The setter is a no-op, so `${NAME:=default}` returns
+/// the default without storing it. See [`ExpandOptions`] for the full grammar
+/// and for the Windows, command-substitution and setter options.
 ///
 /// # Errors
 ///
@@ -209,24 +234,12 @@ pub fn expand_with<'a>(
     value: &str,
     mut lookup: impl FnMut(&str) -> Option<&'a str>,
 ) -> Result<String> {
-    let mut options = ExpandOptions::new(move |name| lookup(name).map(str::to_owned));
-    expand_with_options(value, &mut options)
-}
-
-/// Expands `value` using `options`, consuming them for the duration of the call.
-///
-/// See [`ExpandOptions`] for the accepted forms and their defaults.
-///
-/// # Errors
-///
-/// Returns [`EnvError::Syntax`] when a reference is unterminated or names a
-/// variable a shell would reject, [`EnvError::Required`] for a
-/// `${NAME:?message}` whose value is missing or empty, [`EnvError::SetFailed`]
-/// when the supplied setter fails, and [`EnvError::CommandFailed`] when a
-/// substituted command cannot run or exits non-zero.
-pub fn expand_with_options(value: &str, options: &mut ExpandOptions<'_>) -> Result<String> {
-    let characters: Vec<char> = value.chars().collect();
-    expand_characters(&characters, options)
+    expand(
+        value,
+        ExpandOptions::new()
+            .with_get(move |name| lookup(name).map(str::to_owned))
+            .with_set(|_, _| Ok(())),
+    )
 }
 
 fn expand_characters(characters: &[char], options: &mut ExpandOptions<'_>) -> Result<String> {
@@ -299,7 +312,7 @@ fn expand_characters(characters: &[char], options: &mut ExpandOptions<'_>) -> Re
                 ));
             }
             let name: String = characters[start..end].iter().collect();
-            output.push_str(&(options.lookup)(&name).unwrap_or_default());
+            output.push_str(&(options.get)(&name).unwrap_or_default());
             index = end + 1;
             continue;
         }
@@ -417,7 +430,7 @@ fn interpolate(token: &str, options: &mut ExpandOptions<'_>) -> Result<String> {
         ));
     }
 
-    let value = (options.lookup)(&name).unwrap_or_default();
+    let value = (options.get)(&name).unwrap_or_default();
     if !value.is_empty() {
         return Ok(value);
     }
@@ -425,18 +438,16 @@ fn interpolate(token: &str, options: &mut ExpandOptions<'_>) -> Result<String> {
     match fallback {
         Fallback::Required => Err(EnvError::Required { message: operand }),
         Fallback::Assign => {
-            if let Some(set) = options.set.as_mut() {
-                set(&name, &operand).map_err(|message| EnvError::SetFailed {
-                    key: name.clone(),
-                    message,
-                })?;
-            }
+            (options.set)(&name, &operand).map_err(|message| EnvError::SetFailed {
+                key: name.clone(),
+                message,
+            })?;
             if !options.set_keys.iter().any(|key| key == &name) {
                 options.set_keys.push(name.clone());
             }
             // The setter may write into the same store the lookup reads, so a
             // second lookup is what turns a successful store into the value.
-            let stored = (options.lookup)(&name).unwrap_or_default();
+            let stored = (options.get)(&name).unwrap_or_default();
             if stored.is_empty() {
                 expand_operand(&operand, options)
             } else {
@@ -451,7 +462,7 @@ fn interpolate(token: &str, options: &mut ExpandOptions<'_>) -> Result<String> {
 /// reference of its own.
 fn expand_operand(operand: &str, options: &mut ExpandOptions<'_>) -> Result<String> {
     if operand.contains('$') {
-        expand_with_options(operand, options)
+        options.expand(operand)
     } else {
         Ok(operand.to_owned())
     }
@@ -564,7 +575,7 @@ fn run_command(expression: &str, options: &mut ExpandOptions<'_>) -> Result<Stri
             match segment {
                 Segment::Literal(value) => text.push_str(&value),
                 Segment::Expandable(value) => {
-                    text.push_str(&expand_with_options(&value, options)?);
+                    text.push_str(&options.expand(&value)?);
                 }
             }
         }
@@ -580,7 +591,7 @@ fn run_command(expression: &str, options: &mut ExpandOptions<'_>) -> Result<Stri
     // A value stored by `${NAME:=default}` is exposed to the command, matching
     // what a caller would see for a variable the expansion just created.
     for key in options.set_keys.clone() {
-        command.env(&key, (options.lookup)(&key).unwrap_or_default());
+        command.env(&key, (options.get)(&key).unwrap_or_default());
     }
 
     let output = command.output().map_err(|error| EnvError::CommandFailed {
@@ -604,8 +615,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use super::{ExpandOptions, expand, expand_with, expand_with_options, parse_token, valid_name};
-    use crate::{EnvError, Environment, Platform, TEST_ENV_LOCK};
+    use super::{ExpandOptions, expand, expand_with, parse_token, valid_name};
+    use crate::{EnvError, TEST_ENV_LOCK};
 
     /// Serializes a test that spawns a child process with tests that mutate the
     /// process environment, because spawning reads it.
@@ -796,12 +807,12 @@ mod tests {
     fn options_over_shared_store(stored: &SharedStore) -> ExpandOptions<'static> {
         let lookup = Rc::clone(stored);
         let set = Rc::clone(stored);
-        ExpandOptions::new(move |name| lookup.borrow().get(name).cloned()).with_set(
-            move |name, value| {
+        ExpandOptions::new()
+            .with_get(move |name| lookup.borrow().get(name).cloned())
+            .with_set(move |name, value| {
                 set.borrow_mut().insert(name.to_owned(), value.to_owned());
                 Ok(())
-            },
-        )
+            })
     }
 
     #[test]
@@ -811,7 +822,8 @@ mod tests {
 
     #[test]
     fn a_failing_setter_is_reported_with_its_key() {
-        let mut options = ExpandOptions::new(|_: &str| None)
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
             .with_set(|_, _| Err("store is read-only".to_owned()));
         let error = options.expand("${FOO:=bar}").unwrap_err();
         assert_eq!(
@@ -854,23 +866,27 @@ mod tests {
 
     #[test]
     fn windows_references_are_expanded_when_enabled() {
-        let mut options =
-            ExpandOptions::new(|name: &str| (name == "FOO").then(|| "bar".to_owned()))
-                .with_windows_variables(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|name: &str| (name == "FOO").then(|| "bar".to_owned()))
+            .with_windows_variables(true);
         assert_eq!(options.expand("Value: %FOO%").unwrap(), "Value: bar");
         assert_eq!(options.expand("%MISSING%").unwrap(), "");
     }
 
     #[test]
     fn an_empty_windows_name_is_an_error() {
-        let mut options = ExpandOptions::new(|_: &str| None).with_windows_variables(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_windows_variables(true);
         let error = options.expand("Value: %%").unwrap_err();
         assert!(matches!(error, EnvError::Syntax { .. }), "{error:?}");
     }
 
     #[test]
     fn an_unterminated_windows_reference_is_an_error() {
-        let mut options = ExpandOptions::new(|_: &str| None).with_windows_variables(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_windows_variables(true);
         let error = options.expand("Value: %FOO").unwrap_err();
         assert!(matches!(error, EnvError::Syntax { .. }), "{error:?}");
     }
@@ -889,7 +905,9 @@ mod tests {
     #[test]
     fn command_substitution_runs_the_command_and_trims_its_output() {
         let _guard = process_lock();
-        let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_command_substitution(true);
         assert_eq!(options.expand("Echo: $(echo hi)").unwrap(), "Echo: hi");
     }
 
@@ -897,7 +915,9 @@ mod tests {
     #[test]
     fn command_substitution_reports_a_non_zero_exit() {
         let _guard = process_lock();
-        let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_command_substitution(true);
         let error = options.expand("$(sh -c 'exit 7')").unwrap_err();
         assert_eq!(
             error,
@@ -911,9 +931,9 @@ mod tests {
     #[test]
     fn command_substitution_expands_its_arguments() {
         let _guard = process_lock();
-        let mut options =
-            ExpandOptions::new(|name: &str| (name == "WORD").then(|| "hi".to_owned()))
-                .with_command_substitution(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|name: &str| (name == "WORD").then(|| "hi".to_owned()))
+            .with_command_substitution(true);
         assert_eq!(options.expand("$(echo $WORD)").unwrap(), "hi");
         // Single quotes suppress expansion, as they do in a shell.
         assert_eq!(options.expand("$(echo '$WORD')").unwrap(), "$WORD");
@@ -922,7 +942,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_empty_command_expression_is_an_error() {
-        let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_command_substitution(true);
         let error = options.expand("$()").unwrap_err();
         assert!(matches!(error, EnvError::Syntax { .. }), "{error:?}");
     }
@@ -941,15 +963,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_missing_closing_parenthesis_is_an_error() {
-        let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_command_substitution(true);
         let error = options.expand("$(echo hi").unwrap_err();
         assert!(matches!(error, EnvError::Syntax { .. }), "{error:?}");
     }
 
     #[test]
     fn positional_arguments_are_supplied_explicitly() {
-        let mut options =
-            ExpandOptions::new(|_: &str| None).with_unix_args(["cmd", "first", "second"]);
+        let mut options = ExpandOptions::new()
+            .with_get(|_: &str| None)
+            .with_unix_args(["cmd", "first", "second"]);
         assert_eq!(options.expand("Arg1: ${1}").unwrap(), "Arg1: first");
         assert_eq!(options.expand("Arg1: $1").unwrap(), "Arg1: first");
         assert_eq!(options.expand("Arg9: ${9}").unwrap(), "Arg9: ");
@@ -982,20 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn expanding_through_an_environment_uses_its_platform_rules() {
-        let mut environment = Environment::new(Platform::Windows);
-        environment.set("Path", "/usr/bin");
-        environment.set("HOME", "/home/dev");
-        assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
-        assert_eq!(expand("${MISSING:-/root}", &environment).unwrap(), "/root");
-        assert_eq!(
-            expand_with_options(
-                "${MISSING:=/root}",
-                &mut ExpandOptions::from_environment(&environment)
-            )
-            .unwrap(),
-            "/root"
-        );
-        assert_eq!(environment.get("MISSING"), None);
+    fn the_free_expand_uses_the_configured_callbacks() {
+        let stored = shared_store();
+        let options = options_over_shared_store(&stored);
+        assert_eq!(expand("${FOO:=bar}", options).unwrap(), "bar");
+        assert_eq!(stored.borrow().get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn a_custom_getter_replaces_the_process_lookup() {
+        let mut options =
+            ExpandOptions::new().with_get(|name: &str| (name == "FOO").then(|| "bar".to_owned()));
+        assert_eq!(options.expand("$FOO/${MISSING:-x}").unwrap(), "bar/x");
     }
 }

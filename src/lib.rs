@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 mod expand;
 mod process;
 
-pub use expand::{ExpandOptions, expand, expand_with, expand_with_options};
+pub use expand::{ExpandOptions, expand, expand_with};
 pub use process::{
     append_path, get_var, has_path, has_var, prepend_path, set_path, set_var, unset_var, vars,
 };
@@ -60,9 +60,9 @@ impl Platform {
     /// Returns the conventional spelling of the `PATH` variable on this
     /// platform.
     ///
-    /// The Unix spelling is `PATH`; the Windows spelling is `Path`. A caller
-    /// working through an [`Environment`] can use the spelling it prefers,
-    /// because that type compares keys by the platform's rules.
+    /// The Unix spelling is `PATH`; the Windows spelling is `Path`. The process
+    /// path functions use this spelling and compare entries by the platform's
+    /// rules.
     #[must_use]
     pub const fn path_key(self) -> &'static str {
         match self {
@@ -86,163 +86,6 @@ impl Platform {
             Self::Unix => left == right,
             Self::Windows => left.eq_ignore_ascii_case(right),
         }
-    }
-}
-
-/// An insertion-ordered environment which preserves the first selected key spelling.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Environment {
-    platform: Platform,
-    values: IndexMap<String, String>,
-}
-
-impl Environment {
-    /// Creates an empty environment using the given platform's rules.
-    #[must_use]
-    pub fn new(platform: Platform) -> Self {
-        Self {
-            platform,
-            values: IndexMap::new(),
-        }
-    }
-
-    /// Returns the platform rules used for key comparison and PATH handling.
-    #[must_use]
-    pub fn platform(&self) -> Platform {
-        self.platform
-    }
-
-    /// Returns the value stored under `key`, or `None` when it is not set.
-    ///
-    /// The lookup follows the platform's case rules, so on Windows `path` finds
-    /// an entry stored as `Path`.
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.values
-            .iter()
-            .find(|(existing, _)| self.platform.keys_equal(existing, key))
-            .map(|(_, value)| value.as_str())
-    }
-
-    /// Sets `key` to `value`, returning whatever it held before.
-    ///
-    /// An existing entry keeps the spelling it was first inserted with, so this
-    /// updates in place rather than adding a second entry under a differently
-    /// capitalised name.
-    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
-        let key = key.into();
-        let value = value.into();
-        if let Some(existing) = self
-            .values
-            .keys()
-            .find(|existing| self.platform.keys_equal(existing, &key))
-            .cloned()
-        {
-            return self.values.insert(existing, value);
-        }
-        self.values.insert(key, value)
-    }
-
-    /// Removes `key`, returning its value when it was set.
-    ///
-    /// This is `shift_remove` rather than `swap_remove`, so the order of the
-    /// remaining entries is preserved.
-    pub fn remove(&mut self, key: &str) -> Option<String> {
-        let existing = self
-            .values
-            .keys()
-            .find(|existing| self.platform.keys_equal(existing, key))
-            .cloned()?;
-        self.values.shift_remove(&existing)
-    }
-
-    /// Returns the entries in the order they were first inserted.
-    #[must_use]
-    pub fn as_map(&self) -> &IndexMap<String, String> {
-        &self.values
-    }
-
-    /// Reports whether `key` is set, including when its value is empty.
-    ///
-    /// This is the distinction [`get`](Self::get) cannot express: `Some("")` is
-    /// set, and `None` is not.
-    #[must_use]
-    pub fn has(&self, key: &str) -> bool {
-        self.get(key).is_some()
-    }
-
-    /// Returns the `PATH` value for this platform, or `""` when it is not set.
-    #[must_use]
-    pub fn path(&self) -> &str {
-        self.get(self.platform.path_key()).unwrap_or("")
-    }
-
-    /// Sets the `PATH` value for this platform, returning whatever it held
-    /// before.
-    pub fn set_path(&mut self, value: impl Into<String>) -> Option<String> {
-        self.set(self.platform.path_key(), value)
-    }
-
-    /// Splits the `PATH` value on this platform's separator.
-    ///
-    /// An unset or empty value yields one empty entry, which is what splitting
-    /// an empty string produces. The path helpers skip empty entries when they
-    /// compose a value, so a leading or trailing separator is not introduced.
-    #[must_use]
-    pub fn split_path(&self) -> Vec<&str> {
-        self.path().split(self.platform.path_separator()).collect()
-    }
-
-    /// Reports whether `entry` is in `PATH`, using the platform's case rules.
-    ///
-    /// Windows compares entries without regard to case; Unix does not.
-    #[must_use]
-    pub fn has_path(&self, entry: &str) -> bool {
-        self.split_path()
-            .iter()
-            .any(|existing| self.platform.keys_equal(existing, entry))
-    }
-
-    /// Puts `entry` at the front of `PATH`, and reports whether it changed.
-    ///
-    /// An entry already at the front is left alone, matching the Go package's
-    /// `PrependPath`. An existing empty `PATH` is treated as unset.
-    pub fn prepend_path(&mut self, entry: &str) -> bool {
-        if self
-            .split_path()
-            .first()
-            .is_some_and(|first| self.platform.keys_equal(first, entry))
-        {
-            return false;
-        }
-        let value = path_prepend(
-            self.get(self.platform.path_key()),
-            std::slice::from_ref(&entry.to_owned()),
-            self.platform,
-        );
-        self.set_path(value);
-        true
-    }
-
-    /// Puts `entry` at the end of `PATH`, and reports whether it changed.
-    ///
-    /// An entry already at the end is left alone, matching the Go package's
-    /// `AppendPath`. An existing empty `PATH` is treated as unset.
-    pub fn append_path(&mut self, entry: &str) -> bool {
-        if self
-            .split_path()
-            .last()
-            .is_some_and(|last| self.platform.keys_equal(last, entry))
-        {
-            return false;
-        }
-        let value = path_append(
-            self.get(self.platform.path_key()),
-            std::slice::from_ref(&entry.to_owned()),
-            self.platform,
-        );
-        self.set_path(value);
-        true
     }
 }
 
@@ -715,120 +558,8 @@ fn quote_single(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EnvDiff, EnvError, Environment, Platform, Result, Shell, path_append, path_prepend,
-    };
+    use super::{EnvDiff, EnvError, Platform, Result, Shell, path_append, path_prepend};
     use indexmap::indexmap;
-
-    #[test]
-    fn get_set_unset_and_has_round_trip() {
-        let mut environment = Environment::new(Platform::Unix);
-        assert!(!environment.has("ENV_TEST_KEY"));
-        assert_eq!(environment.get("ENV_TEST_KEY"), None);
-
-        assert_eq!(environment.set("ENV_TEST_KEY", "test_value"), None);
-        assert!(environment.has("ENV_TEST_KEY"));
-        assert_eq!(environment.get("ENV_TEST_KEY"), Some("test_value"));
-
-        assert_eq!(
-            environment.remove("ENV_TEST_KEY"),
-            Some("test_value".into())
-        );
-        assert!(!environment.has("ENV_TEST_KEY"));
-        assert_eq!(environment.get("ENV_TEST_KEY"), None);
-    }
-
-    #[test]
-    fn an_empty_value_is_set_and_still_has_the_key() {
-        let mut environment = Environment::new(Platform::Unix);
-        environment.set("EMPTY", "");
-        assert!(environment.has("EMPTY"));
-        assert_eq!(environment.get("EMPTY"), Some(""));
-    }
-
-    #[test]
-    fn as_map_lists_every_entry_in_insertion_order() {
-        let mut environment = Environment::new(Platform::Unix);
-        environment.set("ENV_ALL_TEST", "all_value");
-        environment.set("SECOND", "two");
-        assert_eq!(
-            environment.as_map().keys().collect::<Vec<_>>(),
-            ["ENV_ALL_TEST", "SECOND"]
-        );
-        assert_eq!(
-            environment.as_map().get("ENV_ALL_TEST").map(String::as_str),
-            Some("all_value")
-        );
-    }
-
-    #[test]
-    fn path_is_read_written_and_split() {
-        let mut environment = Environment::new(Platform::Unix);
-        environment.set_path("/tmp/testpath");
-        assert_eq!(environment.path(), "/tmp/testpath");
-        assert_eq!(environment.split_path(), ["/tmp/testpath"]);
-
-        let joined = Platform::Unix.join_path(["/a", "/b"]);
-        assert_eq!(joined, "/a:/b");
-    }
-
-    #[test]
-    fn prepend_append_and_has_path() {
-        let mut environment = Environment::new(Platform::Unix);
-        environment.set_path("");
-        assert!(!environment.has_path("/foo"));
-
-        assert!(environment.prepend_path("/foo"));
-        assert!(environment.has_path("/foo"));
-        assert_eq!(environment.split_path().first(), Some(&"/foo"));
-
-        assert!(environment.append_path("/bar"));
-        let paths = environment.split_path();
-        assert_eq!(paths.last(), Some(&"/bar"));
-        assert!(environment.has_path("/bar"));
-    }
-
-    #[test]
-    fn prepend_and_append_leave_the_edge_entry_alone() {
-        let mut environment = Environment::new(Platform::Unix);
-        environment.set_path("/first:/last");
-        assert!(!environment.prepend_path("/first"));
-        assert!(!environment.append_path("/last"));
-        assert_eq!(environment.path(), "/first:/last");
-
-        // Only the edge is deduplicated, matching the Go package: an entry in
-        // the middle can still be added at either end.
-        assert!(environment.append_path("/first"));
-        assert_eq!(environment.path(), "/first:/last:/first");
-    }
-
-    #[test]
-    fn an_unset_path_reads_as_empty_and_composes_without_a_separator() {
-        let mut environment = Environment::new(Platform::Unix);
-        assert_eq!(environment.path(), "");
-        assert_eq!(environment.split_path(), [""]);
-        assert!(environment.prepend_path("/foo"));
-        assert_eq!(environment.path(), "/foo");
-    }
-
-    #[test]
-    fn windows_path_keys_and_entries_ignore_case() {
-        let mut environment = Environment::new(Platform::Windows);
-        environment.set_path(r"C:\Windows;C:\Tools");
-        assert_eq!(environment.get("PATH"), Some(r"C:\Windows;C:\Tools"));
-        assert_eq!(environment.get("path"), Some(r"C:\Windows;C:\Tools"));
-        assert_eq!(environment.split_path().len(), 2);
-        assert!(environment.has_path(r"c:\windows"));
-        assert!(environment.has_path(r"C:\TOOLS"));
-
-        // Only the edge is deduplicated, so an entry already at the front is
-        // left alone and an entry in the middle is added at the front.
-        assert!(!environment.prepend_path(r"c:\windows"));
-        assert_eq!(environment.path(), r"C:\Windows;C:\Tools");
-
-        assert!(environment.prepend_path(r"c:\tools"));
-        assert_eq!(environment.path(), r"c:\tools;C:\Windows;C:\Tools");
-    }
 
     #[test]
     fn the_path_separator_follows_the_platform() {
@@ -849,20 +580,6 @@ mod tests {
             path_append(Some("system"), &entries, Platform::Windows),
             "system;first;second"
         );
-    }
-    #[test]
-    fn windows_keys_are_case_insensitive_with_stable_spelling() {
-        let mut environment = Environment::new(Platform::Windows);
-        environment.set("Path", "one");
-        environment.set("PATH", "two");
-        environment.set("pAtH", "three");
-        assert_eq!(
-            environment.as_map(),
-            &indexmap! { String::from("Path") => String::from("three") }
-        );
-        assert_eq!(environment.get("PATH"), Some("three"));
-        assert_eq!(environment.remove("path"), Some("three".into()));
-        assert!(environment.as_map().is_empty());
     }
     #[test]
     fn fixture_diff_reverses_exactly() -> Result<()> {

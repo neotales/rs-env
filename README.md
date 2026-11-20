@@ -16,30 +16,45 @@ cargo add neotales-env
 
 ## What you can do 🔧
 
-**Expand a value from an explicit environment.** `$NAME` and `${NAME}` use the values you provide. An unset name becomes an empty string.
+**Expand against the process.** `ExpandOptions::new()` reads through `get_var` and stores `${NAME:=default}` through `set_var`. Windows `%NAME%` references and `$(command)` substitution stay off.
 
 ```rust
-use neotales_env::{Environment, Platform, expand};
+use neotales_env::{ExpandOptions, expand, set_var};
 
-let mut environment = Environment::new(Platform::Unix);
-environment.set("HOME", "/home/dev");
-
-assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
+set_var("NEOTALES_ENV_DEMO", "/opt/demo").unwrap();
+assert_eq!(
+    expand("$NEOTALES_ENV_DEMO", ExpandOptions::new()).unwrap(),
+    "/opt/demo"
+);
 ```
 
-**Use a default, require a value, or set one.** `${NAME:-fallback}` supplies a default when the name is missing or empty, `${NAME:?message}` turns a missing value into that message, and `${NAME:=fallback}` stores the default through a setter you provide.
+**Override either callback.** `with_get` and `with_set` replace the defaults completely, so the closures below never touch the process.
 
 ```rust
-use neotales_env::{Environment, Platform, expand};
+use neotales_env::ExpandOptions;
 
-let environment = Environment::new(Platform::Unix);
+let mut options = ExpandOptions::new()
+    .with_get(|name| (name == "HOME").then(|| "/home/dev".to_owned()))
+    .with_set(|name, value| {
+        assert_eq!((name, value), ("BRAND", "neotales"));
+        Ok(())
+    });
+
+assert_eq!(options.expand("${HOME}/bin").unwrap(), "/home/dev/bin");
+assert_eq!(options.expand("${BRAND:=neotales}").unwrap(), "neotales");
+```
+
+**Use a default or require a value without the process.** `expand_with` takes a lookup and never reads the process. Its setter is a no-op, so `${NAME:=default}` returns the default without storing it.
+
+```rust
+use neotales_env::expand_with;
 
 assert_eq!(
-    expand("${MISSING:-/usr/local}", &environment).unwrap(),
+    expand_with("${MISSING:-/usr/local}", |_| None).unwrap(),
     "/usr/local"
 );
 
-let error = expand("${MISSING:?MISSING is required}", &environment).unwrap_err();
+let error = expand_with("${MISSING:?MISSING is required}", |_| None).unwrap_err();
 assert_eq!(error.to_string(), "MISSING is required");
 ```
 
@@ -48,43 +63,32 @@ assert_eq!(error.to_string(), "MISSING is required");
 ```rust
 use neotales_env::ExpandOptions;
 
-let mut options = ExpandOptions::new(|name| {
-    (name == "HOME").then(|| "/home/dev".to_owned())
-})
-.with_windows_variables(true);
+let mut options = ExpandOptions::new()
+    .with_get(|name| (name == "HOME").then(|| "/home/dev".to_owned()))
+    .with_windows_variables(true);
 
 assert_eq!(options.expand("%HOME%/bin").unwrap(), "/home/dev/bin");
 ```
 
-**Supply your own lookup.** Use `expand_with` when values come from another source or when you want to define the lookup inline.
+**Compose a `PATH` without the process.** `Platform` supplies the separator and the case rules; the helpers return a new string.
 
 ```rust
-use neotales_env::expand_with;
+use neotales_env::{Platform, path_append, path_prepend};
 
-let path = expand_with("$HOME/bin", |name| (name == "HOME").then_some("/home/dev"));
-assert_eq!(path.unwrap(), "/home/dev/bin");
+let path = path_prepend(Some("/usr/bin"), &["/opt/bin".to_owned()], Platform::Unix);
+assert_eq!(path, "/opt/bin:/usr/bin");
+
+let path = path_append(Some(&path), &["/usr/local/bin".to_owned()], Platform::Unix);
+assert_eq!(path, "/opt/bin:/usr/bin:/usr/local/bin");
 ```
 
-**Compose a `PATH` without guessing the separator.** `Platform` supplies the separator and the case rules, and `Environment` reads, writes and splits the value.
-
-```rust
-use neotales_env::{Environment, Platform};
-
-let mut environment = Environment::new(Platform::Unix);
-environment.set_path("/usr/bin");
-environment.prepend_path("/opt/bin");
-
-assert_eq!(environment.path(), "/opt/bin:/usr/bin");
-assert!(environment.has_path("/usr/bin"));
-```
-
-**Change the process environment when you mean to.** `Environment` edits a map you own and never touches the process. The crate-root functions do edit the process; they also come as `unset_var`, `set_path`, `append_path`, `has_var` and `vars`.
+**Change the process environment when you mean to.** These crate-root functions edit the process; the helpers above and the custom callbacks stay in memory. The process functions also come as `unset_var`, `set_path`, `append_path`, `has_var` and `vars`.
 
 ```rust
 use neotales_env::{get_var, has_path, prepend_path, set_var};
 
-set_var("NEOTALES_ENV_DEMO", "1").unwrap();
-assert_eq!(get_var("NEOTALES_ENV_DEMO").as_deref(), Some("1"));
+set_var("NEOTALES_ENV_DEMO", "/opt/demo").unwrap();
+assert_eq!(get_var("NEOTALES_ENV_DEMO").as_deref(), Some("/opt/demo"));
 
 prepend_path("/opt/bin").unwrap();
 assert!(has_path("/opt/bin"));

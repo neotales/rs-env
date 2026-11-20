@@ -1,8 +1,9 @@
 //! Explicit access to the calling process's environment.
 //!
 //! Every function here changes or reads process-wide state. That is the point:
-//! [`Environment`](crate::Environment) edits a map the caller owns, while these
-//! functions edit the environment the operating system gives the process.
+//! the expansion and path helpers stay pure unless a caller supplies process
+//! callbacks, while these functions edit the environment the operating system
+//! gives the process.
 //!
 //! Reads and writes are serialized among this crate's own calls by a private
 //! mutex, because `std::env::set_var` and `std::env::remove_var` require that no
@@ -345,6 +346,8 @@ mod tests {
     const KEY: &str = "NEOTALES_ENV_TEST_VALUE";
     const EMPTY_KEY: &str = "NEOTALES_ENV_TEST_EMPTY";
     const EQUALS_KEY: &str = "NEOTALES_ENV_TEST_EQUALS";
+    const EXPAND_KEY: &str = "NEOTALES_ENV_TEST_EXPAND";
+    const ASSIGN_KEY: &str = "NEOTALES_ENV_TEST_ASSIGN";
 
     #[test]
     fn set_get_has_and_unset_round_trip() {
@@ -451,6 +454,55 @@ mod tests {
         assert_eq!(get_var(platform.path_key()), None);
         assert!(!has_path("/anything"));
         assert!(!has_path(""));
+    }
+
+    #[test]
+    fn expand_defaults_read_and_write_the_process() {
+        let _guard = test_lock();
+        let mut restore = Restore::capture();
+        restore.track(EXPAND_KEY);
+        restore.track(ASSIGN_KEY);
+        let _ = unset_var(ASSIGN_KEY);
+
+        set_var(EXPAND_KEY, "/home/dev").unwrap();
+        let mut options = crate::ExpandOptions::new();
+        assert_eq!(
+            options.expand(&format!("${EXPAND_KEY}/bin")).unwrap(),
+            "/home/dev/bin"
+        );
+        // Windows references and command substitution stay off by default.
+        assert_eq!(
+            options.expand(&format!("%{EXPAND_KEY}%")).unwrap(),
+            format!("%{EXPAND_KEY}%")
+        );
+        assert_eq!(options.expand("$(echo hi)").unwrap(), "$(echo hi)");
+
+        // The default setter really writes the process.
+        assert_eq!(
+            options
+                .expand(&format!("${{{ASSIGN_KEY}:=fallback}}"))
+                .unwrap(),
+            "fallback"
+        );
+        assert_eq!(get_var(ASSIGN_KEY).as_deref(), Some("fallback"));
+
+        // The free function takes options by value and uses the same defaults.
+        assert_eq!(
+            crate::expand(&format!("${EXPAND_KEY}"), crate::ExpandOptions::new()).unwrap(),
+            "/home/dev"
+        );
+
+        // A custom getter fully replaces the process lookup.
+        let mut custom = crate::ExpandOptions::new()
+            .with_get(|name: &str| (name == "FROM_GET").then(|| "custom".to_owned()));
+        assert_eq!(custom.expand("$FROM_GET").unwrap(), "custom");
+        assert_eq!(
+            custom
+                .expand(&format!("${{{EXPAND_KEY}:-missing}}"))
+                .unwrap(),
+            "missing"
+        );
+        assert_eq!(get_var(EXPAND_KEY).as_deref(), Some("/home/dev"));
     }
 
     #[test]
