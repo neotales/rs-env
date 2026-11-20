@@ -94,8 +94,6 @@ prepend_path("/opt/bin").unwrap();
 assert!(has_path("/opt/bin"));
 ```
 
-![One does not simply expand variables](https://media.giphy.com/media/smW5FBep69d3q/giphy.gif)
-
 ## Licence 📜
 
 MIT. See [LICENSE.md](LICENSE.md).
