@@ -177,7 +177,7 @@ impl<'a> ExpandOptions<'a> {
 /// use neotales_env::{Environment, Platform, expand};
 ///
 /// let mut environment = Environment::new(Platform::Unix);
-/// environment.insert("HOME", "/home/dev");
+/// environment.set("HOME", "/home/dev");
 ///
 /// assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
 /// assert_eq!(expand("${MISSING:-/root}", &environment).unwrap(), "/root");
@@ -973,8 +973,8 @@ mod tests {
     #[test]
     fn expanding_through_an_environment_uses_its_platform_rules() {
         let mut environment = Environment::new(Platform::Windows);
-        environment.insert("Path", "/usr/bin");
-        environment.insert("HOME", "/home/dev");
+        environment.set("Path", "/usr/bin");
+        environment.set("HOME", "/home/dev");
         assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
         assert_eq!(expand("${MISSING:-/root}", &environment).unwrap(), "/root");
         assert_eq!(

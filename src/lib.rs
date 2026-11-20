@@ -118,7 +118,7 @@ impl Environment {
     /// An existing entry keeps the spelling it was first inserted with, so this
     /// updates in place rather than adding a second entry under a differently
     /// capitalised name.
-    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
         let key = key.into();
         let value = value.into();
         if let Some(existing) = self
@@ -169,7 +169,7 @@ impl Environment {
     /// Sets the `PATH` value for this platform, returning whatever it held
     /// before.
     pub fn set_path(&mut self, value: impl Into<String>) -> Option<String> {
-        self.insert(self.platform.path_key(), value)
+        self.set(self.platform.path_key(), value)
     }
 
     /// Splits the `PATH` value on this platform's separator.
@@ -707,7 +707,7 @@ mod tests {
         assert!(!environment.has("ENV_TEST_KEY"));
         assert_eq!(environment.get("ENV_TEST_KEY"), None);
 
-        assert_eq!(environment.insert("ENV_TEST_KEY", "test_value"), None);
+        assert_eq!(environment.set("ENV_TEST_KEY", "test_value"), None);
         assert!(environment.has("ENV_TEST_KEY"));
         assert_eq!(environment.get("ENV_TEST_KEY"), Some("test_value"));
 
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn an_empty_value_is_set_and_still_has_the_key() {
         let mut environment = Environment::new(Platform::Unix);
-        environment.insert("EMPTY", "");
+        environment.set("EMPTY", "");
         assert!(environment.has("EMPTY"));
         assert_eq!(environment.get("EMPTY"), Some(""));
     }
@@ -730,8 +730,8 @@ mod tests {
     #[test]
     fn as_map_lists_every_entry_in_insertion_order() {
         let mut environment = Environment::new(Platform::Unix);
-        environment.insert("ENV_ALL_TEST", "all_value");
-        environment.insert("SECOND", "two");
+        environment.set("ENV_ALL_TEST", "all_value");
+        environment.set("SECOND", "two");
         assert_eq!(
             environment.as_map().keys().collect::<Vec<_>>(),
             ["ENV_ALL_TEST", "SECOND"]
@@ -834,9 +834,9 @@ mod tests {
     #[test]
     fn windows_keys_are_case_insensitive_with_stable_spelling() {
         let mut environment = Environment::new(Platform::Windows);
-        environment.insert("Path", "one");
-        environment.insert("PATH", "two");
-        environment.insert("pAtH", "three");
+        environment.set("Path", "one");
+        environment.set("PATH", "two");
+        environment.set("pAtH", "three");
         assert_eq!(
             environment.as_map(),
             &indexmap! { String::from("Path") => String::from("three") }

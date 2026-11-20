@@ -22,7 +22,7 @@ cargo add neotales-env
 use neotales_env::{Environment, Platform, expand};
 
 let mut environment = Environment::new(Platform::Unix);
-environment.insert("HOME", "/home/dev");
+environment.set("HOME", "/home/dev");
 
 assert_eq!(expand("$HOME/bin", &environment).unwrap(), "/home/dev/bin");
 ```
