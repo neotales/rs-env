@@ -605,7 +605,15 @@ mod tests {
     use std::rc::Rc;
 
     use super::{ExpandOptions, expand, expand_with, expand_with_options, parse_token, valid_name};
-    use crate::{EnvError, Environment, Platform};
+    use crate::{EnvError, Environment, Platform, TEST_ENV_LOCK};
+
+    /// Serializes a test that spawns a child process with tests that mutate the
+    /// process environment, because spawning reads it.
+    fn process_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Expands against a fixed set of values, so a test says what it expects
     /// rather than which variable it happened to look up.
@@ -880,6 +888,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_substitution_runs_the_command_and_trims_its_output() {
+        let _guard = process_lock();
         let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
         assert_eq!(options.expand("Echo: $(echo hi)").unwrap(), "Echo: hi");
     }
@@ -887,6 +896,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_substitution_reports_a_non_zero_exit() {
+        let _guard = process_lock();
         let mut options = ExpandOptions::new(|_: &str| None).with_command_substitution(true);
         let error = options.expand("$(sh -c 'exit 7')").unwrap_err();
         assert_eq!(
@@ -900,6 +910,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_substitution_expands_its_arguments() {
+        let _guard = process_lock();
         let mut options =
             ExpandOptions::new(|name: &str| (name == "WORD").then(|| "hi".to_owned()))
                 .with_command_substitution(true);

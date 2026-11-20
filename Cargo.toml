@@ -1,6 +1,6 @@
 [package]
 name = "neotales-env"
-description = "Pure environment interpolation, PATH composition and reversible shell diffs, with no process mutation"
+description = "Environment interpolation, PATH composition, reversible shell diffs, and explicit process-environment access"
 version = "0.0.0-alpha.0"
 edition = "2024"
 rust-version = "1.100"
@@ -15,7 +15,7 @@ categories = ["command-line-interface", "config"]
 indexmap = { version = "2.12", features = ["serde"] }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"

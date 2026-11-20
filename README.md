@@ -1,6 +1,6 @@
 # neotales-env
 
-Expand environment-variable references, compose `PATH` values and build reversible shell changes without changing the process environment.
+Expand environment-variable references, compose `PATH` values and build reversible shell changes without hidden process mutation.
 
 By [x0craft](https://github.com/x0craft).
 
@@ -76,6 +76,18 @@ environment.prepend_path("/opt/bin");
 
 assert_eq!(environment.path(), "/opt/bin:/usr/bin");
 assert!(environment.has_path("/usr/bin"));
+```
+
+**Change the process environment when you mean to.** `Environment` edits a map you own and never touches the process. The crate-root functions do edit the process; they also come as `unset_var`, `set_path`, `append_path`, `has_var` and `vars`.
+
+```rust
+use neotales_env::{get_var, has_path, prepend_path, set_var};
+
+set_var("NEOTALES_ENV_DEMO", "1").unwrap();
+assert_eq!(get_var("NEOTALES_ENV_DEMO").as_deref(), Some("1"));
+
+prepend_path("/opt/bin").unwrap();
+assert!(has_path("/opt/bin"));
 ```
 
 ![One does not simply expand variables](https://media.giphy.com/media/smW5FBep69d3q/giphy.gif)

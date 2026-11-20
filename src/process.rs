@@ -1,0 +1,469 @@
+//! Explicit access to the calling process's environment.
+//!
+//! Every function here changes or reads process-wide state. That is the point:
+//! [`Environment`](crate::Environment) edits a map the caller owns, while these
+//! functions edit the environment the operating system gives the process.
+//!
+//! Reads and writes are serialized among this crate's own calls by a private
+//! mutex, because `std::env::set_var` and `std::env::remove_var` require that no
+//! other thread reads or writes the environment at the same time. The mutex
+//! cannot constrain code outside this crate: the caller must not touch the
+//! process environment from another thread while one of these calls runs.
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use indexmap::IndexMap;
+
+use crate::{EnvError, Platform, Result, path_append, path_prepend, validate_key};
+
+/// Serializes this crate's own process-environment access.
+///
+/// A panic while the lock is held poisons it. Continuing with the guarded data
+/// is correct here because the guarded value is `()`, so the tests and the
+/// library use the same recovery.
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+fn environment_lock() -> MutexGuard<'static, ()> {
+    ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Reports whether `key` can be passed to a standard-library environment
+/// function without panicking.
+///
+/// A process can contain names this crate would never write itself, so a read
+/// accepts anything the platform accepts. This is deliberately weaker than the
+/// name rule [`set_var`] and [`unset_var`] enforce.
+fn queryable(key: &str) -> bool {
+    !key.is_empty() && !key.contains('=') && !key.contains('\0')
+}
+
+/// Reads a value and keeps invalid Unicode visible as absence.
+fn read_variable(key: &str) -> Option<String> {
+    std::env::var_os(key)?.into_string().ok()
+}
+
+/// Writes a value, refusing a key or value the operating system cannot store.
+///
+/// The caller must hold [`ENVIRONMENT_LOCK`].
+#[allow(unsafe_code)]
+fn write_variable(key: &str, value: &str) -> Result<()> {
+    validate_key(key)?;
+    if value.as_bytes().contains(&0) {
+        return Err(EnvError::NulValue);
+    }
+    // SAFETY: every call in this crate takes ENVIRONMENT_LOCK for the whole
+    // read-modify-write, so this crate's calls are serialized. Code outside
+    // this crate can still race, which is the caller's documented obligation.
+    unsafe { std::env::set_var(key, value) };
+    Ok(())
+}
+
+/// Removes a value, refusing a key the operating system cannot accept.
+///
+/// The caller must hold [`ENVIRONMENT_LOCK`].
+#[allow(unsafe_code)]
+fn remove_variable(key: &str) -> Result<()> {
+    validate_key(key)?;
+    // SAFETY: every call in this crate takes ENVIRONMENT_LOCK for the whole
+    // operation, so this crate's calls are serialized. Code outside this crate
+    // can still race, which is the caller's documented obligation.
+    unsafe { std::env::remove_var(key) };
+    Ok(())
+}
+
+/// Returns the process value of `key`, or `None` when it is not set.
+///
+/// An empty value is `Some("")`, which is stricter than Go's `Get`: use
+/// [`has_var`] when the question is whether the name exists. A name this
+/// platform cannot query, or a value that is not valid Unicode, is `None`.
+///
+/// This reads the calling process's environment. The crate serializes its own
+/// calls with a private mutex, but the caller must not mutate the environment
+/// from another thread while this runs, for the reason `std::env::var_os`
+/// documents.
+#[must_use]
+pub fn get_var(key: &str) -> Option<String> {
+    if !queryable(key) {
+        return None;
+    }
+    let _guard = environment_lock();
+    read_variable(key)
+}
+
+/// Sets `key` in the calling process's environment.
+///
+/// This writes process-wide state. The crate serializes its own calls with a
+/// private mutex, but the caller must not read or write the environment from
+/// another thread while this runs; `std::env::set_var` carries the same
+/// requirement.
+///
+/// # Errors
+///
+/// Returns [`EnvError::InvalidKey`] when `key` is not a shell name, and
+/// [`EnvError::NulValue`] when `value` contains a NUL byte. In both cases the
+/// process environment is not touched.
+///
+/// ```
+/// use neotales_env::{get_var, set_var};
+///
+/// set_var("NEOTALES_ENV_EXAMPLE", "1").unwrap();
+/// assert_eq!(get_var("NEOTALES_ENV_EXAMPLE").as_deref(), Some("1"));
+/// ```
+pub fn set_var(key: &str, value: &str) -> Result<()> {
+    let _guard = environment_lock();
+    write_variable(key, value)
+}
+
+/// Reports whether `key` exists in the calling process's environment.
+///
+/// This includes a variable whose value is empty, and unlike [`get_var`] it says
+/// nothing about whether the value is Unicode.
+///
+/// This reads the calling process's environment. The crate serializes its own
+/// calls with a private mutex, but the caller must not mutate the environment
+/// from another thread while this runs.
+#[must_use]
+pub fn has_var(key: &str) -> bool {
+    if !queryable(key) {
+        return false;
+    }
+    let _guard = environment_lock();
+    std::env::var_os(key).is_some()
+}
+
+/// Removes `key` from the calling process's environment.
+///
+/// This writes process-wide state. The crate serializes its own calls with a
+/// private mutex, but the caller must not read or write the environment from
+/// another thread while this runs; `std::env::remove_var` carries the same
+/// requirement.
+///
+/// # Errors
+///
+/// Returns [`EnvError::InvalidKey`] when `key` is not a shell name, and does not
+/// call the operating system in that case.
+pub fn unset_var(key: &str) -> Result<()> {
+    let _guard = environment_lock();
+    remove_variable(key)
+}
+
+/// Returns the process environment in the order the platform lists it.
+///
+/// Empty values are dropped, matching Go's `All`. A value that itself contains
+/// `=` is kept: the operating system already supplies the pair split at the
+/// first `=` in the entry. Pairs that are not valid Unicode on either side are
+/// skipped rather than causing a panic. If the platform supplies the same key
+/// twice, the last value wins and the first position is kept.
+///
+/// This reads the calling process's environment. The crate serializes its own
+/// calls with a private mutex, but the caller must not mutate the environment
+/// from another thread while this runs.
+#[must_use]
+pub fn vars() -> IndexMap<String, String> {
+    let _guard = environment_lock();
+    let mut result = IndexMap::new();
+    for (key, value) in std::env::vars_os() {
+        let (Ok(key), Ok(value)) = (key.into_string(), value.into_string()) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        result.insert(key, value);
+    }
+    result
+}
+
+/// Replaces the platform's `PATH` value in the calling process.
+///
+/// This writes process-wide state. The crate serializes its own calls with a
+/// private mutex, but the caller must not read or write the environment from
+/// another thread while this runs.
+///
+/// # Errors
+///
+/// Returns [`EnvError::NulValue`] when `value` contains a NUL byte. The `PATH`
+/// key itself is always a valid name.
+pub fn set_path(value: &str) -> Result<()> {
+    let _guard = environment_lock();
+    write_variable(Platform::host().path_key(), value)
+}
+
+/// Puts `entry` at the front of the process `PATH`.
+///
+/// The call is a no-op returning `Ok(())` when `entry` is already the first
+/// entry, matching Go's `PrependPath`. An unset or empty `PATH` is treated as
+/// having no entries, so no leading separator is introduced.
+///
+/// This writes process-wide state. The crate serializes its own calls with a
+/// private mutex, but the caller must not read or write the environment from
+/// another thread while this runs.
+///
+/// # Errors
+///
+/// Returns [`EnvError::NulValue`] when `entry` contains a NUL byte.
+///
+/// ```
+/// use neotales_env::{has_path, prepend_path};
+///
+/// prepend_path("/opt/bin").unwrap();
+/// assert!(has_path("/opt/bin"));
+/// ```
+pub fn prepend_path(entry: &str) -> Result<()> {
+    let platform = Platform::host();
+    let key = platform.path_key();
+    let _guard = environment_lock();
+    let current = read_variable(key);
+    let already_first = current.as_deref().is_some_and(|value| {
+        value
+            .split(platform.path_separator())
+            .next()
+            .is_some_and(|first| platform.keys_equal(first, entry))
+    });
+    if already_first {
+        return Ok(());
+    }
+    let value = path_prepend(
+        current.as_deref(),
+        std::slice::from_ref(&entry.to_owned()),
+        platform,
+    );
+    write_variable(key, &value)
+}
+
+/// Puts `entry` at the end of the process `PATH`.
+///
+/// The call is a no-op returning `Ok(())` when `entry` is already the last
+/// entry, matching Go's `AppendPath`. An unset or empty `PATH` is treated as
+/// having no entries, so no trailing separator is introduced.
+///
+/// This writes process-wide state. The crate serializes its own calls with a
+/// private mutex, but the caller must not read or write the environment from
+/// another thread while this runs.
+///
+/// # Errors
+///
+/// Returns [`EnvError::NulValue`] when `entry` contains a NUL byte.
+pub fn append_path(entry: &str) -> Result<()> {
+    let platform = Platform::host();
+    let key = platform.path_key();
+    let _guard = environment_lock();
+    let current = read_variable(key);
+    let already_last = current.as_deref().is_some_and(|value| {
+        value
+            .split(platform.path_separator())
+            .next_back()
+            .is_some_and(|last| platform.keys_equal(last, entry))
+    });
+    if already_last {
+        return Ok(());
+    }
+    let value = path_append(
+        current.as_deref(),
+        std::slice::from_ref(&entry.to_owned()),
+        platform,
+    );
+    write_variable(key, &value)
+}
+
+/// Reports whether `entry` is in the process `PATH`.
+///
+/// This is `false` when `PATH` is unset. Empty entries never match, so an empty
+/// entry left by a trailing separator cannot be found by a query such as
+/// `has_path("")`. Windows compares entries without regard to case.
+///
+/// This reads the calling process's environment. The crate serializes its own
+/// calls with a private mutex, but the caller must not mutate the environment
+/// from another thread while this runs.
+#[must_use]
+pub fn has_path(entry: &str) -> bool {
+    let platform = Platform::host();
+    let _guard = environment_lock();
+    let Some(current) = read_variable(platform.path_key()) else {
+        return false;
+    };
+    current
+        .split(platform.path_separator())
+        .any(|existing| !existing.is_empty() && platform.keys_equal(existing, entry))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{MutexGuard, PoisonError};
+
+    use super::{
+        append_path, get_var, has_path, has_var, prepend_path, set_path, set_var, unset_var, vars,
+    };
+    use crate::{EnvError, Platform, TEST_ENV_LOCK};
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Restores `PATH` and unsets every key a test touched when it drops.
+    ///
+    /// Dropped while the test lock is still held, so the restore cannot race
+    /// another test.
+    struct Restore {
+        keys: Vec<String>,
+        path: Option<String>,
+    }
+
+    impl Restore {
+        fn capture() -> Self {
+            Self {
+                keys: Vec::new(),
+                path: get_var(Platform::host().path_key()),
+            }
+        }
+
+        fn track(&mut self, key: &str) {
+            if !self.keys.iter().any(|tracked| tracked == key) {
+                self.keys.push(key.to_owned());
+            }
+        }
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                let _ = unset_var(key);
+            }
+            match &self.path {
+                Some(value) => {
+                    let _ = set_path(value);
+                }
+                None => {
+                    let _ = unset_var(Platform::host().path_key());
+                }
+            }
+        }
+    }
+
+    const KEY: &str = "NEOTALES_ENV_TEST_VALUE";
+    const EMPTY_KEY: &str = "NEOTALES_ENV_TEST_EMPTY";
+    const EQUALS_KEY: &str = "NEOTALES_ENV_TEST_EQUALS";
+
+    #[test]
+    fn set_get_has_and_unset_round_trip() {
+        let _guard = test_lock();
+        let mut restore = Restore::capture();
+        restore.track(KEY);
+        let _ = unset_var(KEY);
+
+        assert!(!has_var(KEY));
+        assert_eq!(get_var(KEY), None);
+
+        set_var(KEY, "value").unwrap();
+        assert_eq!(get_var(KEY).as_deref(), Some("value"));
+        assert!(has_var(KEY));
+
+        unset_var(KEY).unwrap();
+        assert_eq!(get_var(KEY), None);
+        assert!(!has_var(KEY));
+    }
+
+    #[test]
+    fn an_empty_value_is_set_but_is_not_listed() {
+        let _guard = test_lock();
+        let mut restore = Restore::capture();
+        restore.track(EMPTY_KEY);
+
+        set_var(EMPTY_KEY, "").unwrap();
+        assert_eq!(get_var(EMPTY_KEY), Some(String::new()));
+        assert!(has_var(EMPTY_KEY));
+        assert!(!vars().contains_key(EMPTY_KEY));
+    }
+
+    #[test]
+    fn an_invalid_key_is_refused_before_the_environment_is_touched() {
+        let _guard = test_lock();
+        let _restore = Restore::capture();
+
+        for key in ["1BAD", "BAD-KEY", "", "A=B", "A\0B"] {
+            let error = set_var(key, "value").unwrap_err();
+            assert_eq!(
+                error,
+                EnvError::InvalidKey {
+                    key: key.to_owned()
+                },
+                "set_var accepted {key:?}"
+            );
+            assert_eq!(unset_var(key).unwrap_err(), error);
+            assert!(!has_var(key), "set_var stored {key:?}");
+        }
+    }
+
+    #[test]
+    fn vars_keeps_a_value_that_contains_an_equals_sign() {
+        let _guard = test_lock();
+        let mut restore = Restore::capture();
+        restore.track(EQUALS_KEY);
+
+        set_var(EQUALS_KEY, "left=right").unwrap();
+        let listing = vars();
+        assert_eq!(
+            listing.get(EQUALS_KEY).map(String::as_str),
+            Some("left=right")
+        );
+    }
+
+    #[test]
+    fn path_functions_read_write_prepend_and_append() {
+        let _guard = test_lock();
+        let _restore = Restore::capture();
+        let platform = super::Platform::host();
+
+        let original = platform.join_path(["/first", "/last"]);
+        set_path(&original).unwrap();
+        assert_eq!(get_var(platform.path_key()).as_deref(), Some(&*original));
+        assert!(has_path("/first"));
+        assert!(has_path("/last"));
+        assert!(!has_path("/absent"));
+
+        prepend_path("/first").unwrap();
+        assert_eq!(get_var(platform.path_key()).as_deref(), Some(&*original));
+        append_path("/last").unwrap();
+        assert_eq!(get_var(platform.path_key()).as_deref(), Some(&*original));
+
+        prepend_path("/new").unwrap();
+        assert_eq!(
+            get_var(platform.path_key()).as_deref(),
+            Some(&*platform.join_path(["/new", "/first", "/last"]))
+        );
+        append_path("/tail").unwrap();
+        assert_eq!(
+            get_var(platform.path_key()).as_deref(),
+            Some(&*platform.join_path(["/new", "/first", "/last", "/tail"]))
+        );
+        assert!(has_path("/tail"));
+    }
+
+    #[test]
+    fn has_path_is_false_when_path_is_unset() {
+        let _guard = test_lock();
+        let _restore = Restore::capture();
+        let platform = super::Platform::host();
+
+        unset_var(platform.path_key()).unwrap();
+        assert_eq!(get_var(platform.path_key()), None);
+        assert!(!has_path("/anything"));
+        assert!(!has_path(""));
+    }
+
+    #[test]
+    fn the_public_names_are_crate_root_functions() {
+        // Compiles only while the names resolve at the crate root.
+        let _: fn(&str) -> Option<String> = crate::get_var;
+        let _: fn(&str, &str) -> crate::Result<()> = crate::set_var;
+        let _: fn(&str) -> bool = crate::has_var;
+        let _: fn(&str) -> crate::Result<()> = crate::unset_var;
+        let _: fn() -> indexmap::IndexMap<String, String> = crate::vars;
+        let _: fn(&str) -> crate::Result<()> = crate::set_path;
+        let _: fn(&str) -> crate::Result<()> = crate::prepend_path;
+        let _: fn(&str) -> crate::Result<()> = crate::append_path;
+        let _: fn(&str) -> bool = crate::has_path;
+    }
+}

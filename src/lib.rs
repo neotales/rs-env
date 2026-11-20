@@ -6,8 +6,19 @@ use std::fmt;
 use indexmap::IndexMap;
 
 mod expand;
+mod process;
 
 pub use expand::{ExpandOptions, expand, expand_with, expand_with_options};
+pub use process::{
+    append_path, get_var, has_path, has_var, prepend_path, set_path, set_var, unset_var, vars,
+};
+
+/// Serializes tests that read or mutate the process environment.
+///
+/// Command substitution spawns a child process, which reads the environment, so
+/// those tests take this lock too.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Platform rules used for environment-key and PATH handling.
 ///
@@ -306,6 +317,11 @@ pub enum EnvError {
         /// Why the command failed.
         message: String,
     },
+    /// A value contains a NUL byte, which an environment entry cannot store.
+    ///
+    /// The operating system rejects it, and `std::env::set_var` would panic, so
+    /// the write is refused before the process is touched.
+    NulValue,
 }
 
 impl fmt::Display for EnvError {
@@ -323,6 +339,9 @@ impl fmt::Display for EnvError {
             Self::CommandFailed { message } => {
                 write!(formatter, "command substitution failed: {message}")
             }
+            Self::NulValue => formatter.write_str(
+                "the value contains a NUL byte, which cannot be stored in the environment",
+            ),
         }
     }
 }
