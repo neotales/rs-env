@@ -616,10 +616,16 @@ mod tests {
     use std::rc::Rc;
 
     use super::{ExpandOptions, expand, expand_with, parse_token, valid_name};
-    use crate::{EnvError, TEST_ENV_LOCK};
+    use crate::EnvError;
+    #[cfg(unix)]
+    use crate::TEST_ENV_LOCK;
 
     /// Serializes a test that spawns a child process with tests that mutate the
     /// process environment, because spawning reads it.
+    ///
+    /// Only the `unix` tests spawn a command, so this is unix-only; without the
+    /// gate it is dead code on Windows and `-D warnings` refuses the build.
+    #[cfg(unix)]
     fn process_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_ENV_LOCK
             .lock()
